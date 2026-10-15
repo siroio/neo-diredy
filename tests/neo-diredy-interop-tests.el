@@ -87,6 +87,195 @@
              (should (= 1 (length (window-list))))))
        (kill-buffer plugin)))))
 
+(ert-deftest neo-diredy-interop-return-after-popup-dismissal ()
+  ;; All three dismissals leave the selected Dired window and point unchanged.
+  (dolist (dismiss '(quit delete kill))
+    (ert-info ((format "Dismissal: %s" dismiss))
+      (neo-diredy-test--with-directory
+       (let ((popup (generate-new-buffer " *diredy-dismiss*"))
+             (source (current-buffer)))
+         (unwind-protect
+             (progn
+               (neo-diredy-mode 1)
+               (let ((window (display-buffer popup '(display-buffer-below-selected))))
+                 (run-hooks 'post-command-hook)
+                 (should-not neo-diredy--layout-mode)
+                 (pcase dismiss
+                   ('quit (quit-window nil window))
+                   ('delete (delete-window window))
+                   ('kill (kill-buffer popup)))
+                 (run-hooks 'post-command-hook)
+                 (should neo-diredy--layout-mode)
+                 (should (eq (window-buffer neo-diredy--center) source))
+                 (should dired-hide-details-mode)))
+           (neo-diredy-mode -1)
+           (when (buffer-live-p popup) (kill-buffer popup))))))))
+
+(ert-deftest neo-diredy-interop-return-after-window-restore ()
+  (neo-diredy-test--with-directory
+   (let ((original (current-window-configuration))
+         (popup (generate-new-buffer " *diredy-restore*")))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (display-buffer popup '(display-buffer-below-selected))
+           (run-hooks 'post-command-hook)
+           (should-not neo-diredy--layout-mode)
+           (set-window-configuration original)
+           (run-hooks 'post-command-hook)
+           (should neo-diredy--layout-mode)
+           (should (= 3 (length (window-list)))))
+       (neo-diredy-mode -1)
+       (kill-buffer popup)))))
+
+(ert-deftest neo-diredy-interop-return-from-same-window ()
+  (dolist (return '(switch previous switch-prev bury quit kill))
+    (ert-info ((format "Return: %s" return))
+      (neo-diredy-test--with-directory
+       (let ((plugin (generate-new-buffer " *diredy-return*"))
+             (source (current-buffer)))
+         (unwind-protect
+             (progn
+               (neo-diredy-mode 1)
+               (pop-to-buffer-same-window plugin)
+               (run-hooks 'post-command-hook)
+               (should-not neo-diredy--layout-mode)
+               (pcase return
+                 ('switch (switch-to-buffer source))
+                 ('previous (previous-buffer))
+                 ('switch-prev (switch-to-prev-buffer))
+                 ('bury (bury-buffer))
+                 ('quit (quit-window))
+                 ('kill (kill-buffer plugin)))
+               (set-buffer (window-buffer))
+               (should (eq (current-buffer) source))
+               (run-hooks 'post-command-hook)
+               (should neo-diredy--layout-mode)
+               (should (= 3 (length (window-list)))))
+           (neo-diredy-mode -1)
+           (when (buffer-live-p plugin) (kill-buffer plugin))))))))
+
+(ert-deftest neo-diredy-interop-return-by-selecting-dired-window ()
+  (neo-diredy-test--with-directory
+   (let ((source-window (selected-window))
+         (popup (generate-new-buffer " *diredy-selected-popup*")))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (pop-to-buffer popup '(display-buffer-below-selected))
+           (run-hooks 'post-command-hook)
+           (should-not neo-diredy--layout-mode)
+           (select-window source-window)
+           (run-hooks 'post-command-hook)
+           (should neo-diredy--layout-mode)
+           (should (get-buffer-window popup)))
+       (neo-diredy-mode -1)
+       (kill-buffer popup)))))
+
+(ert-deftest neo-diredy-interop-return-after-help-quit ()
+  (neo-diredy-test--with-directory
+   (let ((old-help (get-buffer "*Help*")))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (describe-function 'dired)
+           (run-hooks 'post-command-hook)
+           (should-not neo-diredy--layout-mode)
+           (quit-window nil (get-buffer-window "*Help*"))
+           (run-hooks 'post-command-hook)
+           (should neo-diredy--layout-mode)
+           (should (= 3 (length (window-list)))))
+       (neo-diredy-mode -1)
+       (when (and (not old-help) (get-buffer "*Help*")) (kill-buffer "*Help*"))))))
+
+(ert-deftest neo-diredy-interop-return-by-explicit-dired-entry ()
+  (neo-diredy-test--with-directory
+   (let ((popup (generate-new-buffer " *diredy-explicit-entry*")))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (display-buffer popup '(display-buffer-below-selected))
+           (run-hooks 'post-command-hook)
+           (should-not neo-diredy--layout-mode)
+           (dired root)
+           (run-hooks 'post-command-hook)
+           (should neo-diredy--layout-mode)
+           (should (get-buffer-window popup)))
+       (neo-diredy-mode -1)
+       (kill-buffer popup)))))
+
+(ert-deftest neo-diredy-interop-return-through-tabs ()
+  (neo-diredy-test--with-directory
+   (let ((source (current-buffer))
+         (popup (generate-new-buffer " *diredy-tab*"))
+         new-tab)
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (tab-new)
+           (setq new-tab t)
+           (switch-to-buffer popup)
+           (run-hooks 'post-command-hook)
+           (should-not neo-diredy--layout-mode)
+           (tab-previous)
+           (run-hooks 'post-command-hook)
+           (should (eq (current-buffer) source))
+           (should neo-diredy--layout-mode)
+           (tab-next)
+           (run-hooks 'post-command-hook)
+           (should (eq (current-buffer) popup))
+           (should-not neo-diredy--layout-mode)
+           (tab-close)
+           (setq new-tab nil)
+           (run-hooks 'post-command-hook)
+           (should neo-diredy--layout-mode))
+       (neo-diredy-mode -1)
+       (when new-tab (tab-close))
+       (kill-buffer popup)))))
+
+(ert-deftest neo-diredy-interop-disabled-mode-stays-disabled-on-return ()
+  (neo-diredy-test--with-directory
+   (let ((source (current-buffer))
+         (plugin (generate-new-buffer " *diredy-disabled*")))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (pop-to-buffer-same-window plugin)
+           (run-hooks 'post-command-hook)
+           (neo-diredy-mode -1)
+           (switch-to-buffer source)
+           (run-hooks 'post-command-hook)
+           (should-not neo-diredy--layout-mode)
+           (should (= 1 (length (window-list)))))
+       (neo-diredy-mode -1)
+       (kill-buffer plugin)))))
+
+(ert-deftest neo-diredy-interop-return-through-command-loop ()
+  (neo-diredy-test--with-directory
+   (let ((popup (generate-new-buffer " *diredy-command-loop*"))
+         (overriding-terminal-local-map (make-sparse-keymap)))
+     (set-keymap-parent overriding-terminal-local-map global-map)
+     (define-key overriding-terminal-local-map [f6]
+                 (lambda () (interactive)
+                   (display-buffer popup '(display-buffer-below-selected))))
+     (define-key overriding-terminal-local-map [f7]
+                 (lambda () (interactive)
+                   (quit-window nil (get-buffer-window popup))))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           ;; Let the real command loop invoke hooks; do not call them by hand.
+           (execute-kbd-macro [f6])
+           (should-not neo-diredy--layout-mode)
+           (let ((overriding-terminal-local-map nil))
+             (execute-kbd-macro (kbd "M-x ignore RET")))
+           (should-not neo-diredy--layout-mode)
+           (execute-kbd-macro [f7])
+           (should neo-diredy--layout-mode)
+           (should (= 3 (length (window-list)))))
+       (neo-diredy-mode -1)
+       (kill-buffer popup)))))
+
 (ert-deftest neo-diredy-interop-ibuffer-and-help ()
   (neo-diredy-test--with-directory
    (let ((name (generate-new-buffer-name "*diredy-test-ibuffer*"))
@@ -191,7 +380,7 @@
            (set-buffer (window-buffer (selected-window)))
            (should (derived-mode-p 'neo-git-mode))
            (setq owner (current-buffer))
-           (neo-diredy--post-command)
+           (run-hooks 'post-command-hook)
            (should-not neo-diredy--layout-mode)
            (should (window-live-p neo-git--history-window))
            (should-not (window-parameter nil 'no-other-window))
@@ -199,7 +388,7 @@
            (set-buffer (window-buffer (selected-window)))
            (should (eq (current-buffer) source))
            (should (= 1 (length (window-list))))
-           (neo-diredy--auto-enable)
+           (run-hooks 'post-command-hook)
            (should neo-diredy--layout-mode)
            (should (= 3 (length (window-list)))))
        (neo-diredy-mode -1)

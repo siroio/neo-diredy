@@ -50,7 +50,7 @@
 (defvar neo-diredy--configuration nil)
 (defvar neo-diredy--windows nil)
 (defvar neo-diredy--handoff nil
-  "Selected window, buffer and point held until navigation after a handoff.")
+  "Selection and window contents held until navigation after a handoff.")
 (defvar neo-diredy--buffers nil)
 (defvar neo-diredy--overlays nil)
 (defvar neo-diredy--timer nil)
@@ -590,6 +590,12 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
              (eq (window-frame neo-diredy--center) (selected-frame)))
     (neo-diredy--layout-mode -1)))
 
+(defun neo-diredy--handoff-state ()
+  "Describe the selection and displayed buffers after releasing the layout."
+  (list (selected-window) (window-buffer) (window-point)
+        (mapcar (lambda (window) (cons window (window-buffer window)))
+                (window-list nil 'no-minibuffer))))
+
 (defun neo-diredy--stop ()
   "Restore saved presentation and dispose only of owned preview buffers."
   (unless (neo-diredy--layout-intact-p)
@@ -651,7 +657,11 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
         neo-diredy--left nil neo-diredy--right nil neo-diredy--margins nil
         neo-diredy--configuration nil neo-diredy--key nil
         neo-diredy--directory nil neo-diredy--timer nil
-        neo-diredy--decorated nil neo-diredy--preview-key nil))
+        neo-diredy--decorated nil neo-diredy--preview-key nil)
+  ;; Capture after our panes are gone.  Closing a popup or restoring a window
+  ;; configuration must resume Dired even when its selected point is unchanged.
+  (when neo-diredy--handoff
+    (setq neo-diredy--handoff (neo-diredy--handoff-state))))
 
 ;;;###autoload
 (define-minor-mode neo-diredy--layout-mode
@@ -700,12 +710,12 @@ All ordinary Dired operations remain available."
   "Activate a layout for the selected, local Dired window."
   ;; A nonselecting popup leaves Dired selected.  Do not immediately recreate
   ;; its panes later in the same post-command hook, or on unrelated commands.
-  ;; Moving point, changing windows/buffers, or explicitly entering Dired
+  ;; Moving point, closing popups, changing windows/buffers, or entering Dired
   ;; resumes normal automatic activation without special-casing keymaps.
-  (when (and (not (active-minibuffer-window))
+  (when (and neo-diredy--handoff (not (active-minibuffer-window))
              (or entry-arguments
                  (not (equal neo-diredy--handoff
-                             (list (selected-window) (window-buffer) (window-point))))))
+                             (neo-diredy--handoff-state)))))
     (setq neo-diredy--handoff nil))
   (when (and neo-diredy-mode (not neo-diredy--layout-mode)
              (not neo-diredy--handoff)
