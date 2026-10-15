@@ -18,6 +18,7 @@
 (require 'subr-x)
 (require 'dired)
 (require 'hl-line)
+(require 'face-remap)
 (require 'image)
 (require 'sqlite)
 (require 'tab-bar)
@@ -687,8 +688,13 @@ All ordinary Dired operations remain available."
               (set symbol (generate-new-buffer (format " *%s*" symbol)))
               (with-current-buffer (symbol-value symbol)
                 (special-mode)
-                (setq-local truncate-lines t cursor-type nil mode-line-format nil
-                            display-line-numbers nil)))
+                (setq-local truncate-lines t cursor-type nil mode-line-format '(" ")
+                            display-line-numbers nil)
+                ;; Keep the bottom edge continuous with the active Dired pane.
+                ;; These remappings live only in our disposable auxiliary buffers.
+                (face-remap-add-relative
+                 'mode-line-inactive
+                 (if (facep 'mode-line-active) 'mode-line-active 'mode-line))))
             (let ((width (window-total-width)))
               (setq neo-diredy--left (split-window neo-diredy--center (- (max 16 (/ width 5))) 'left)
                     neo-diredy--right (split-window neo-diredy--center nil 'right)))
