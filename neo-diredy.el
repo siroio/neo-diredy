@@ -565,24 +565,25 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
       (setq neo-diredy--configuration nil)
       (neo-diredy--layout-mode -1))
      ((eq (selected-window) neo-diredy--center)
-      ;; Mode/state switches can alter presentation without moving point or
-      ;; changing buffer text.  Repair styling before every redisplay, while
-      ;; retaining the dirty flag for the expensive listing decorations.
-      (neo-diredy--style)
-      (let ((key (list (current-buffer) major-mode (point) (buffer-chars-modified-tick))))
-        (unless (equal key neo-diredy--key)
-          (neo-diredy--art-cancel)
-          (let ((job (cdr (assq 'size neo-diredy--metadata-jobs))))
-            (when (and job (not (equal (neo-diredy--original-file) (process-get job 'key))))
-              (neo-diredy--metadata-cancel 'size)))
-          (setq neo-diredy--key key)
-          (when (timerp neo-diredy--timer) (cancel-timer neo-diredy--timer))
-          (if (or (not (eq (current-buffer) (car neo-diredy--decorated)))
-                  (not (equal default-directory neo-diredy--directory)))
-              ;; Directory styling must precede command-loop redisplay.
-              (neo-diredy--refresh)
-            (setq neo-diredy--timer
-                  (run-with-idle-timer 0.12 nil #'neo-diredy--refresh)))))))))
+      (with-current-buffer (window-buffer neo-diredy--center)
+        ;; Mode/state switches can alter presentation without moving point or
+        ;; changing buffer text.  Repair styling before every redisplay, while
+        ;; retaining the dirty flag for the expensive listing decorations.
+        (neo-diredy--style)
+        (let ((key (list (current-buffer) major-mode (point) (buffer-chars-modified-tick))))
+          (unless (equal key neo-diredy--key)
+            (neo-diredy--art-cancel)
+            (let ((job (cdr (assq 'size neo-diredy--metadata-jobs))))
+              (when (and job (not (equal (neo-diredy--original-file) (process-get job 'key))))
+                (neo-diredy--metadata-cancel 'size)))
+            (setq neo-diredy--key key)
+            (when (timerp neo-diredy--timer) (cancel-timer neo-diredy--timer))
+            (if (or (not (eq (current-buffer) (car neo-diredy--decorated)))
+                    (not (equal default-directory neo-diredy--directory)))
+                ;; Directory styling must precede command-loop redisplay.
+                (neo-diredy--refresh)
+              (setq neo-diredy--timer
+                    (run-with-idle-timer 0.12 nil #'neo-diredy--refresh))))))))))
 
 (defun neo-diredy--before-layout-change (&rest _)
   "Close the layout before another interface saves our temporary panes."
@@ -717,17 +718,19 @@ All ordinary Dired operations remain available."
                  (not (equal neo-diredy--handoff
                              (neo-diredy--handoff-state)))))
     (setq neo-diredy--handoff nil))
-  (when (and neo-diredy-mode (not neo-diredy--layout-mode)
-             (not neo-diredy--handoff)
-             (not (active-minibuffer-window))
-             (eq (current-buffer) (window-buffer (selected-window)))
-             (derived-mode-p 'dired-mode 'wdired-mode)
-             (not (file-remote-p default-directory))
-             (not (window-dedicated-p))
-             (>= (window-total-width) 72))
-    (condition-case err
-        (neo-diredy--layout-mode 1)
-      (error (message "neo-diredy: %s" (error-message-string err))))))
+  ;; set-window-configuration can restore Dired while current-buffer still
+  ;; names the interface being closed throughout post-command-hook.
+  (with-current-buffer (window-buffer (selected-window))
+    (when (and neo-diredy-mode (not neo-diredy--layout-mode)
+               (not neo-diredy--handoff)
+               (not (active-minibuffer-window))
+               (derived-mode-p 'dired-mode 'wdired-mode)
+               (not (file-remote-p default-directory))
+               (not (window-dedicated-p))
+               (>= (window-total-width) 72))
+      (condition-case err
+          (neo-diredy--layout-mode 1)
+        (error (message "neo-diredy: %s" (error-message-string err)))))))
 
 ;;;###autoload
 (define-minor-mode neo-diredy-mode

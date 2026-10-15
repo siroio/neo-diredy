@@ -276,6 +276,33 @@
        (neo-diredy-mode -1)
        (kill-buffer popup)))))
 
+(ert-deftest neo-diredy-interop-hooks-use-displayed-buffer ()
+  (neo-diredy-test--with-directory
+   (let ((plugin (generate-new-buffer " *diredy-hook-context*"))
+         (source (current-buffer)))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (pop-to-buffer-same-window plugin)
+           (run-hooks 'post-command-hook)
+           (should-not neo-diredy--layout-mode)
+           ;; A restored window does not necessarily change current-buffer.
+           (set-window-buffer (selected-window) source)
+           (with-current-buffer plugin
+             (run-hooks 'post-command-hook)
+             (should (eq (current-buffer) plugin)))
+           (should neo-diredy--layout-mode)
+           (should (eq (window-buffer neo-diredy--center) source))
+           (with-current-buffer plugin
+             (let ((header header-line-format))
+               (run-hooks 'post-command-hook)
+               (should (equal header-line-format header))
+               (should-not (bound-and-true-p dired-hide-details-mode))
+               (should (eq (current-buffer) plugin))))
+           (should (buffer-local-value 'dired-hide-details-mode source)))
+       (neo-diredy-mode -1)
+       (kill-buffer plugin)))))
+
 (ert-deftest neo-diredy-interop-ibuffer-and-help ()
   (neo-diredy-test--with-directory
    (let ((name (generate-new-buffer-name "*diredy-test-ibuffer*"))
@@ -356,9 +383,11 @@
    (neo-diredy--layout-mode -1)
    (should-not (advice-member-p #'neo-diredy--before-layout-change 'neo-git--layout))))
 
-(ert-deftest neo-diredy-interop-neo-git-round-trip ()
+(defun neo-diredy-interop--neo-git-round-trip ()
+  "Open real Neo Git asynchronously, then quit through its q binding."
   (let ((library (expand-file-name "../../neo-git/neo-git.el" neo-diredy-test-root)))
-    (skip-unless (and (file-exists-p library) (executable-find "git")))
+    (unless (and (file-exists-p library) (executable-find "git"))
+      (ert-skip "Neo Git checkout and Git executable are required"))
     (load library nil t))
   (neo-diredy-test--with-directory
    (let ((source (current-buffer))
@@ -384,11 +413,9 @@
            (should-not neo-diredy--layout-mode)
            (should (window-live-p neo-git--history-window))
            (should-not (window-parameter nil 'no-other-window))
-           (neo-git-quit)
-           (set-buffer (window-buffer (selected-window)))
-           (should (eq (current-buffer) source))
-           (should (= 1 (length (window-list))))
-           (run-hooks 'post-command-hook)
+           ;; Do not repair current-buffer or run an extra command after quit.
+           (execute-kbd-macro (kbd "q"))
+           (should (eq (window-buffer) source))
            (should neo-diredy--layout-mode)
            (should (= 3 (length (window-list)))))
        (neo-diredy-mode -1)
@@ -398,3 +425,16 @@
        ;; Only children created by this isolated test are ours to stop.
        (dolist (process (seq-difference (process-list) processes))
          (when (process-live-p process) (delete-process process)))))))
+
+(ert-deftest neo-diredy-interop-neo-git-round-trip ()
+  (neo-diredy-interop--neo-git-round-trip))
+
+(ert-deftest neo-diredy-interop-neo-git-round-trip-with-evil ()
+  ;; The optional Evil suite sets load-path to existing read-only packages.
+  (skip-unless (require 'evil nil t))
+  (let ((was-enabled (bound-and-true-p evil-mode)))
+    (unwind-protect
+        (progn
+          (evil-mode 1)
+          (neo-diredy-interop--neo-git-round-trip))
+      (unless was-enabled (evil-mode -1)))))
