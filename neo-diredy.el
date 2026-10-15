@@ -20,6 +20,7 @@
 (require 'hl-line)
 (require 'face-remap)
 (require 'image)
+(require 'json)
 (require 'sqlite)
 (require 'tab-bar)
 (declare-function dired-preview-mode "dired-preview" (&optional arg))
@@ -59,6 +60,13 @@
 (defvar neo-diredy--directory nil)
 (defvar neo-diredy--decorated nil)
 (defvar neo-diredy--preview-key nil)
+(defvar neo-diredy--details-window nil)
+(defvar neo-diredy--details-buffer nil)
+(defvar neo-diredy--details-key nil)
+(defvar neo-diredy--details-data nil)
+(defvar neo-diredy--details-cache nil)
+(defvar neo-diredy--details-process nil)
+(defvar neo-diredy--details-resizing nil)
 (defconst neo-diredy--library (or load-file-name buffer-file-name))
 (defvar neo-diredy--art-process nil)
 (defvar neo-diredy--art-cache nil)
@@ -99,6 +107,7 @@ Advising its layout function does not load or require the optional package.")
   "Invalidate anchors after a whole listing is replaced, including WDired."
   (setq neo-diredy--decorated nil neo-diredy--listing-dirty t)
   (neo-diredy--art-stop)
+  (neo-diredy--details-stop)
   (neo-diredy--metadata-stop))
 
 (defun neo-diredy--original-file ()
@@ -441,8 +450,383 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
             (cons target (file-attributes target 'integer)))
         (cons file attributes)))))
 
+;;; Preview details (bounded reads; no visiting files or running major modes)
+
+(defun neo-diredy--details-layout ()
+  "Reserve at most a quarter of the right column for three detail lines."
+  (let* ((neo-diredy--details-resizing t)
+         (footer neo-diredy--details-window)
+         (height (+ (window-total-height neo-diredy--right)
+                    (if (window-live-p footer) (window-total-height footer) 0)))
+         (column-pixels (+ (window-pixel-height neo-diredy--right)
+                           (if (window-live-p footer) (window-pixel-height footer) 0)))
+         (line-pixels (frame-char-height (window-frame neo-diredy--right)))
+         (pixels (+ (* 3 line-pixels)
+                    (max line-pixels (window-mode-line-height
+                                      (if (window-live-p footer) footer neo-diredy--right)))))
+         (window-resize-pixelwise t)
+         (window-min-height 2))
+    (when (and (>= height 16) (<= (* 4 pixels) column-pixels) (not (window-live-p footer)))
+      (setq footer (ignore-errors (split-window neo-diredy--right -4 'below))
+            neo-diredy--details-window footer)
+      (when footer
+        (set-window-buffer footer neo-diredy--details-buffer)
+        (set-window-dedicated-p footer t)
+        (set-window-parameter footer 'no-other-window t)
+        (push (cons footer neo-diredy--details-buffer) neo-diredy--windows)))
+    (when (window-live-p footer)
+      (with-current-buffer neo-diredy--preview (setq mode-line-format nil))
+      ;; Themes can make the mode-line taller than a text line.  Reserve its
+      ;; actual pixels as well, otherwise the third detail line gets clipped.
+      (unless (= pixels (window-pixel-height footer))
+        (ignore-errors (window-resize footer (- pixels (window-pixel-height footer)) nil nil t)))
+      (when (or (< height 16)
+                (< (window-body-height neo-diredy--right) 6)
+                (> (* 4 (window-pixel-height footer))
+                   (+ (window-pixel-height footer) (window-pixel-height neo-diredy--right))))
+        (setq neo-diredy--windows (assq-delete-all footer neo-diredy--windows))
+        (delete-window footer)
+        (setq neo-diredy--details-window nil)))
+    (with-current-buffer neo-diredy--preview
+      (setq mode-line-format
+            (unless (window-live-p neo-diredy--details-window)
+              '(:eval (list (or (car (neo-diredy--details-lines
+                                     neo-diredy--details-data
+                                     (max 1 (- (window-body-width) 2)))) " "))))))))
+
+(defun neo-diredy--details-resize (frame)
+  "Refit the preview and details after FRAME changes size."
+  (when (and (not neo-diredy--details-resizing) neo-diredy--layout-mode
+             (window-live-p neo-diredy--center)
+             (eq frame (window-frame neo-diredy--center))
+             (neo-diredy--layout-intact-p))
+    (let ((neo-diredy--details-resizing t)) (neo-diredy--refresh))))
+
+(defun neo-diredy--details-fit (items width)
+  "Fit whole ITEMS into WIDTH columns, dropping lower priority fields."
+  (let ((line ""))
+    (dolist (item (delq nil (copy-sequence items)))
+      (let* ((clean (replace-regexp-in-string "[[:cntrl:]]" " " item))
+             (candidate (if (string-empty-p line) clean (concat line " · " clean))))
+        (when (<= (string-width candidate) width) (setq line candidate))))
+    line))
+
+(defun neo-diredy--details-lines (data width)
+  "Return up to three detail lines for DATA, each fitting WIDTH columns."
+  (list (neo-diredy--details-fit (list (plist-get data :format) (plist-get data :size)) width)
+        (let ((items (plist-get data :primary)))
+          (when (and (eq (plist-get data :kind) 'binary) (car items)
+                     (> (length (car items)) width) (>= width 23))
+            (setq items (list (substring (car items) 0 23))))
+          (neo-diredy--details-fit items width))
+        (neo-diredy--details-fit (append (plist-get data :extra)
+                                        (list (plist-get data :modified))) width)))
+
+(defun neo-diredy--details-paint ()
+  "Paint cached details without any file I/O during redisplay."
+  (when (and (buffer-live-p neo-diredy--details-buffer)
+             (window-live-p neo-diredy--right))
+    (with-current-buffer neo-diredy--details-buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (string-join
+                 (mapcar (lambda (line) (concat " " line))
+                         (neo-diredy--details-lines neo-diredy--details-data
+                                                    (max 1 (- (window-body-width neo-diredy--right) 2))))
+                 "\n"))
+        (add-face-text-property (point-min) (point-max) 'shadow)
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)))
+    (force-mode-line-update t)))
+
+(defun neo-diredy--details-image-header (bytes)
+  "Return format, dimensions and depth from a bounded image header BYTES."
+  (cond
+   ((and (>= (length bytes) 26) (string-prefix-p "8BPS" bytes)
+         (memq (neo-diredy--art-uint bytes 4 2) '(1 2)))
+    (list (if (= (neo-diredy--art-uint bytes 4 2) 2) "PSB" "PSD")
+          (neo-diredy--art-uint bytes 18 4) (neo-diredy--art-uint bytes 14 4)
+          (neo-diredy--art-uint bytes 22 2)))
+   ((and (>= (length bytes) 25)
+         (string-prefix-p (unibyte-string 137 80 78 71 13 10 26 10) bytes)
+         (equal (substring bytes 12 16) "IHDR"))
+    (list "PNG" (neo-diredy--art-uint bytes 16 4) (neo-diredy--art-uint bytes 20 4)
+          (aref bytes 24)))
+   ((and (>= (length bytes) 10) (member (substring bytes 0 6) '("GIF87a" "GIF89a")))
+    (list "GIF" (+ (aref bytes 6) (* 256 (aref bytes 7)))
+          (+ (aref bytes 8) (* 256 (aref bytes 9)))))
+   ((and (> (length bytes) 4) (string-prefix-p (unibyte-string 255 216) bytes))
+    (let ((offset 2) found)
+      (while (and (not found) (< (+ offset 4) (length bytes)) (= (aref bytes offset) 255))
+        (let ((marker (aref bytes (1+ offset))))
+          (cond
+           ((= marker 255) (setq offset (1+ offset)))
+           ((memq marker '(216 217 218)) (setq offset (length bytes)))
+           (t
+            (let ((size (neo-diredy--art-uint bytes (+ offset 2) 2)))
+              (when (and (memq marker '(192 193 194 195 197 198 199 201 202 203 205 206 207))
+                         (>= size 8) (<= (+ offset 9) (length bytes)))
+                (setq found (list "JPEG" (neo-diredy--art-uint bytes (+ offset 7) 2)
+                                  (neo-diredy--art-uint bytes (+ offset 5) 2)
+                                  (aref bytes (+ offset 4)))))
+              (setq offset (if (< size 2) (length bytes) (+ offset 2 size))))))))
+      (or found '("JPEG"))))))
+
+(defun neo-diredy--details-language (file text)
+  "Guess a language from FILE and TEXT without executing mode selection."
+  (or (cdr (assoc (downcase (or (file-name-extension file) ""))
+                  '(("el" . "Emacs Lisp") ("py" . "Python") ("js" . "JavaScript")
+                    ("jsx" . "JavaScript/JSX") ("ts" . "TypeScript") ("tsx" . "TypeScript/TSX")
+                    ("rs" . "Rust") ("go" . "Go") ("c" . "C") ("h" . "C/C++ header")
+                    ("cpp" . "C++") ("hpp" . "C++ header") ("cs" . "C#") ("java" . "Java")
+                    ("rb" . "Ruby") ("php" . "PHP") ("lua" . "Lua") ("sh" . "Shell")
+                    ("ps1" . "PowerShell") ("json" . "JSON") ("yaml" . "YAML") ("yml" . "YAML")
+                    ("toml" . "TOML") ("xml" . "XML") ("html" . "HTML") ("css" . "CSS")
+                    ("md" . "Markdown") ("sql" . "SQL") ("tex" . "LaTeX") ("svg" . "SVG"))))
+      (when (string-prefix-p "#!" text)
+        (let ((first (car (split-string text "\n"))))
+          (cond ((string-match-p "python" first) "Python")
+                ((string-match-p "node" first) "JavaScript")
+                ((string-match-p "\\b\\(ba\\|z\\|fi\\)?sh\\b" first) "Shell"))))
+      "Text"))
+
+(defun neo-diredy--details-utf32 (bytes little-endian)
+  "Decode bounded UTF-32 BYTES after its BOM, using LITTLE-ENDIAN order."
+  (let ((text (string-to-multibyte (make-string (max 0 (/ (- (length bytes) 4) 4)) 0))))
+    (dotimes (i (length text))
+      (let* ((offset (+ 4 (* i 4)))
+             (unit (substring bytes offset (+ offset 4)))
+             (value (neo-diredy--art-uint (if little-endian (reverse unit) unit) 0 4)))
+        (unless (and (<= value #x10ffff) (not (<= #xd800 value #xdfff)))
+          (error "Invalid UTF-32 scalar"))
+        (aset text i value)))
+    text))
+
+(defun neo-diredy--details-read (file attributes)
+  "Read bounded descriptive data for local FILE using ATTRIBUTES."
+  (let* ((size (file-attribute-size attributes))
+         (data (list :size (if (numberp size) (file-size-human-readable size 'iec " ") "")
+                     :modified (when attributes (format-time-string "%Y-%m-%d %H:%M"
+                                                                    (file-attribute-modification-time attributes)))))
+         (extension (downcase (or (file-name-extension (or file "")) ""))))
+    (cond
+     ((or (null file) (file-remote-p file) (null attributes)) (plist-put data :format "Unavailable"))
+     ((eq (file-attribute-type attributes) t)
+      (plist-put (plist-put data :size nil) :format "Directory"))
+     ((not (file-regular-p file)) (plist-put data :format "Special file"))
+     (t
+      (let* ((bytes (neo-diredy--art-read file 0 (min size 65536)))
+             (image (neo-diredy--details-image-header bytes))
+             (binary (cond ((string-prefix-p "\177ELF" bytes) "ELF")
+                           ((string-prefix-p "MZ" bytes) "DOS/PE")
+                           ((string-prefix-p "PK\3\4" bytes) "ZIP")
+                           ((string-prefix-p "%PDF-" bytes) "PDF")
+                           ((string-prefix-p "SQLite format 3\0" bytes) "SQLite"))))
+        (cond
+         (image
+          (setq data (plist-put data :kind 'image)
+                data (plist-put data :format (car image)))
+          (when (and (cadr image) (caddr image))
+            (setq data (plist-put data :primary (list (format "%d × %d" (cadr image) (caddr image))))))
+          (when (nth 3 image)
+            (setq data (plist-put data :extra
+                                 (list (format "%d %s" (nth 3 image)
+                                               (if (equal (car image) "PNG") "bit/sample" "bit/channel")))))))
+         ((member extension '("clip" "psd" "psb" "png" "jpg" "jpeg" "gif" "bmp" "webp" "tif" "tiff" "avif" "heic"))
+          (setq data (plist-put data :kind 'image)
+                data (plist-put data :format (concat (upcase extension) " (extension)"))))
+         ((member extension '("mp4" "mkv" "webm" "mov" "avi" "wmv" "m4v" "mpg" "mpeg" "mts"))
+          (setq data (plist-put data :kind 'video)
+                data (plist-put data :format (concat (upcase extension) " (extension)"))))
+         ((member extension '("mp3" "wav" "flac" "ogg" "opus" "m4a" "aac" "aiff" "wma"))
+          (setq data (plist-put data :kind 'audio)
+                data (plist-put data :format (concat (upcase extension) " (extension)"))))
+         (t
+          (let* ((utf32 (cond ((string-prefix-p (unibyte-string 255 254 0 0) bytes) 'little)
+                              ((string-prefix-p (unibyte-string 0 0 254 255) bytes) 'big)))
+                 (coding (cond ((string-prefix-p (unibyte-string 255 254) bytes) 'utf-16le-with-signature)
+                               ((string-prefix-p (unibyte-string 254 255) bytes) 'utf-16be-with-signature)
+                               ((string-prefix-p (unibyte-string 239 187 191) bytes) 'utf-8-with-signature)
+                               (t (or (detect-coding-string bytes t) 'no-conversion))))
+                 (decoded (if utf32 (neo-diredy--details-utf32 bytes (eq utf32 'little))
+                            (decode-coding-string bytes (coding-system-change-eol-conversion coding 0)))))
+            (when (and utf32 (<= size 65536) (not (zerop (% size 4))))
+              (error "Truncated UTF-32 character"))
+            (if (or binary (string-match-p "[\0-\10\16-\37]" decoded))
+                (setq data (plist-put data :kind 'binary)
+                      data (plist-put data :format (or binary "Binary"))
+                      data (plist-put data :primary
+                                      (list (mapconcat (lambda (byte) (format "%02X" byte))
+                                                       (substring bytes 0 (min 16 (length bytes))) " "))))
+              (let* ((crlf (string-match-p "\r\n" decoded))
+                     (rest (replace-regexp-in-string "\r\n" "" decoded))
+                     (lf (string-match-p "\n" rest)) (cr (string-match-p "\r" rest))
+                     (eol (cond ((> (+ (if crlf 1 0) (if lf 1 0) (if cr 1 0)) 1) "Mixed EOL")
+                                (crlf "CRLF") (lf "LF") (cr "CR") (t "No EOL"))))
+                (setq data (plist-put data :kind 'text)
+                      data (plist-put data :utf32 utf32)
+                      data (plist-put data :format (neo-diredy--details-language file decoded))
+                      data (plist-put data :primary
+                                      (list (if utf32 (if (eq utf32 'little) "UTF-32LE" "UTF-32BE")
+                                              (concat (symbol-name (coding-system-base coding))
+                                                      (unless (memq coding '(utf-16le-with-signature utf-16be-with-signature utf-8-with-signature))
+                                                        " (guess)")))
+                                            (concat eol (if (> size (length bytes)) " (sample)" ""))))))))))
+        data)))))
+
+(defun neo-diredy--details-art (file bytes)
+  "Add explicitly labelled CLIP preview dimensions from extracted BYTES."
+  (when (and (equal file (car neo-diredy--details-key))
+             (equal (downcase (or (file-name-extension file) "")) "clip"))
+    (let ((image (neo-diredy--details-image-header bytes)))
+      (when (and (cadr image) (caddr image))
+        (setq neo-diredy--details-data
+              (plist-put neo-diredy--details-data :primary
+                         (list (format "Preview %d × %d" (cadr image) (caddr image)))))
+        (neo-diredy--details-paint)))))
+
+(defun neo-diredy--details-media (json data)
+  "Merge bounded ffprobe JSON into DATA, ignoring attached cover pictures."
+  (let* ((object (json-parse-string json :object-type 'alist :array-type 'list))
+         (streams (alist-get 'streams object))
+         (video (seq-find (lambda (s) (and (equal (alist-get 'codec_type s) "video")
+                                           (not (eq (alist-get 'attached_pic (alist-get 'disposition s)) 1)))) streams))
+         (audio (seq-find (lambda (s) (equal (alist-get 'codec_type s) "audio")) streams))
+         (format-info (alist-get 'format object))
+         (duration (alist-get 'duration format-info))
+         (seconds (and (stringp duration) (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" duration)
+                       (string-to-number duration)))
+         (image (eq (plist-get data :kind) 'image))
+         (primary nil) (extra nil))
+    (unless (or video audio) (error "No media stream"))
+    (when (or video audio)
+      (setq data (plist-put data :kind (if video (if (eq (plist-get data :kind) 'image) 'image 'video) 'audio)))
+      (if image
+          (setq data (plist-put data :format
+                               (upcase (or (alist-get 'codec_name video) (plist-get data :format)))))
+        (when-let* ((name (alist-get 'format_name format-info)))
+          (setq data (plist-put data :format
+                               (cond ((string-prefix-p "mov,mp4" name) "MOV/MP4")
+                                     ((equal name "matroska,webm") "Matroska/WebM")
+                                     (t name))))))
+      (when (and video (numberp (alist-get 'width video)) (numberp (alist-get 'height video)))
+        (push (format "%d × %d" (alist-get 'width video) (alist-get 'height video)) primary))
+      (when (and seconds (not image)) (push (format "%d:%02d" (/ (floor seconds) 60) (% (floor seconds) 60)) primary))
+      (when audio
+        (when-let* ((rate (alist-get 'sample_rate audio))) (push (format "%s Hz" rate) primary))
+        (when-let* ((channels (alist-get 'channels audio))) (push (format "%s ch" channels) primary)))
+      (when-let* ((codec (alist-get 'codec_name (or video audio)))) (push codec extra))
+      (when-let* ((rate (and (not image) (alist-get 'avg_frame_rate video))))
+        (when (string-match "\\`\\([0-9]+\\)/\\([0-9]+\\)\\'" rate)
+          (let ((n (string-to-number (match-string 1 rate))) (d (string-to-number (match-string 2 rate))))
+            (when (and (> n 0) (> d 0)) (push (format "%.2f fps avg" (/ (float n) d)) extra)))))
+      (setq data (plist-put data :primary (nreverse primary))
+            data (plist-put data :extra (nreverse extra))))
+    data))
+
+(defun neo-diredy--details-cancel ()
+  "Cancel a details probe and dispose its output and deadline."
+  (when-let* ((process neo-diredy--details-process))
+    (setq neo-diredy--details-process nil neo-diredy--details-key nil)
+    (set-process-sentinel process #'ignore)
+    (when (timerp (process-get process 'timer)) (cancel-timer (process-get process 'timer)))
+    (when (process-live-p process) (delete-process process))
+    (when (buffer-live-p (process-buffer process)) (kill-buffer (process-buffer process)))))
+
+(defun neo-diredy--details-stop ()
+  "Release all details state on listing reload or layout exit."
+  (neo-diredy--details-cancel)
+  (setq neo-diredy--details-key nil neo-diredy--details-data nil neo-diredy--details-cache nil))
+
+(defun neo-diredy--details-remember (key data)
+  "Keep at most 32 compact metadata entries identified by KEY."
+  (setq neo-diredy--details-cache
+        (seq-take (cons (cons key data) (assoc-delete-all key neo-diredy--details-cache)) 32)))
+
+(defun neo-diredy--details-finished (process _event)
+  "Publish PROCESS's result only if its file and selection are still current."
+  (when (and (eq process neo-diredy--details-process)
+             (memq (process-status process) '(exit signal)))
+    (let* ((key (process-get process 'key))
+           (data (copy-tree (process-get process 'data)))
+           (json (when (buffer-live-p (process-buffer process))
+                   (with-current-buffer (process-buffer process) (buffer-string))))
+           (valid (and (equal key neo-diredy--details-key)
+                       (equal key (ignore-errors (neo-diredy--art-signature (car key))))
+                       (neo-diredy--layout-intact-p)
+                       (with-current-buffer (window-buffer neo-diredy--center)
+                         (equal (car key) (neo-diredy--original-file))))))
+      (if (and (zerop (process-exit-status process)) (not (process-get process 'failed)))
+          (condition-case nil (setq data (neo-diredy--details-media json data))
+            (error (setq data (plist-put data :extra '("Details unavailable")))))
+        (setq data (plist-put data :extra '("Details unavailable"))))
+      (neo-diredy--details-cancel)
+      (when valid
+        (setq neo-diredy--details-key key neo-diredy--details-data data)
+        (neo-diredy--details-remember key data)
+        (neo-diredy--details-paint)))))
+
+(defun neo-diredy--details-probe (file key data executable)
+  "Start a bounded ffprobe using EXECUTABLE for FILE, KEY and DATA."
+  (let ((buffer (generate-new-buffer " *neo-diredy-probe*")))
+    (condition-case nil
+        (let ((process (make-process
+                        :name "neo-diredy-probe" :buffer buffer :noquery t
+                        :connection-type 'pipe :coding 'utf-8-unix
+                        :command (list executable "-v" "quiet" "-protocol_whitelist" "file,pipe"
+                                       "-probesize" "1048576" "-analyzeduration" "1000000"
+                                       "-show_entries"
+                                       "format=format_name,duration:stream=codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels:stream_disposition=attached_pic"
+                                       "-of" "json" "-i" (expand-file-name file))
+                        :filter (lambda (process chunk)
+                                  (when (buffer-live-p (process-buffer process))
+                                    (with-current-buffer (process-buffer process)
+                                      (if (> (+ (buffer-size) (length chunk)) 65536)
+                                          (progn (process-put process 'failed t) (delete-process process))
+                                        (goto-char (point-max)) (insert chunk)))))
+                        :sentinel #'neo-diredy--details-finished)))
+          (setq neo-diredy--details-process process)
+          (process-put process 'key key)
+          (process-put process 'data data)
+          (process-put process 'timer
+                       (run-at-time 5 nil (lambda ()
+                                            (when (eq process neo-diredy--details-process)
+                                              (process-put process 'failed t)
+                                              (delete-process process))))))
+      (error (kill-buffer buffer)
+             (setq neo-diredy--details-data (plist-put data :extra '("Details unavailable")))
+             (neo-diredy--details-remember key neo-diredy--details-data)))))
+
+(defun neo-diredy--details-refresh (file)
+  "Read details once per FILE content change, independent of window size."
+  (let ((key (ignore-errors (neo-diredy--art-signature file))))
+    (unless (equal key neo-diredy--details-key)
+      (neo-diredy--details-cancel)
+      (setq neo-diredy--details-key key
+            neo-diredy--details-data
+            (or (copy-tree (cdr (assoc key neo-diredy--details-cache)))
+                (condition-case nil
+                    (neo-diredy--details-read file (cdr (neo-diredy--file-info file)))
+                  (error '(:format "Unavailable")))))
+      (unless (assoc key neo-diredy--details-cache)
+        (let* ((kind (plist-get neo-diredy--details-data :kind))
+               (probe (or (memq kind '(video audio))
+                          (and (eq kind 'image) (not (plist-get neo-diredy--details-data :primary))
+                               (not (member (downcase (or (file-name-extension file) "")) '("clip" "psd" "psb"))))))
+               (executable (and probe (executable-find "ffprobe"))))
+          (if executable
+              (progn
+                (neo-diredy--details-probe file key neo-diredy--details-data executable)
+                (when neo-diredy--details-process
+                  (setq neo-diredy--details-data (plist-put (copy-tree neo-diredy--details-data) :extra '("Reading details…")))))
+            (when probe (setq neo-diredy--details-data (plist-put neo-diredy--details-data :extra '("ffprobe not installed"))))
+            (neo-diredy--details-remember key neo-diredy--details-data)))))
+    (neo-diredy--details-paint)))
+
 (defun neo-diredy--render-preview (file)
   "Reuse FILE's preview until metadata, size limits or window size change."
+  (neo-diredy--details-layout)
+  (neo-diredy--details-refresh file)
   (let* ((info (ignore-errors (neo-diredy--file-info file)))
          (attributes (cdr info))
          (key (list file (car info) (file-attribute-modification-time attributes)
@@ -486,10 +870,12 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
                          (erase-buffer)
                          (condition-case err
                              (if (eq (car result) 'image)
-                                 (insert-image
+                                 (progn
+                                   (neo-diredy--details-art file (cdr result))
+                                   (insert-image
                                   (create-image (cdr result) nil t
                                                 :max-width (window-body-width window t)
-                                                :max-height (window-body-height window t)))
+                                                :max-height (window-body-height window t))))
                                (insert "Preview unavailable: " (cdr result)))
                            (error (insert "Preview unavailable: " (error-message-string err))))
                          (goto-char (point-min))
@@ -506,7 +892,13 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
                (type (insert (format "Image: %s (%s)\nInline preview unavailable or over size limit"
                                      type (file-size-human-readable size))))
                (t
-                (insert-file-contents file nil 0 (min size neo-diredy-preview-bytes))
+                (if-let* ((utf32 (plist-get neo-diredy--details-data :utf32)))
+                    (insert (replace-regexp-in-string
+                             "\r\n?" "\n"
+                             (neo-diredy--details-utf32
+                              (neo-diredy--art-read file 0 (min size neo-diredy-preview-bytes))
+                              (eq utf32 'little))))
+                  (insert-file-contents file nil 0 (min size neo-diredy-preview-bytes)))
                 (if (save-excursion (goto-char (point-min)) (search-forward "\0" nil t))
                     (progn (erase-buffer) (insert (format "Binary file (%s)" (file-size-human-readable size))))
                   (when (> size neo-diredy-preview-bytes)
@@ -574,6 +966,7 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
         (let ((key (list (current-buffer) major-mode (point) (buffer-chars-modified-tick))))
           (unless (equal key neo-diredy--key)
             (neo-diredy--art-cancel)
+            (neo-diredy--details-cancel)
             (let ((job (cdr (assq 'size neo-diredy--metadata-jobs))))
               (when (and job (not (equal (neo-diredy--original-file) (process-get job 'key))))
                 (neo-diredy--metadata-cancel 'size)))
@@ -606,11 +999,13 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
       (setq neo-diredy--handoff
             (list (selected-window) (window-buffer) (window-point)))))
   (neo-diredy--art-stop)
+  (neo-diredy--details-stop)
   (neo-diredy--metadata-stop)
   (when (and (window-live-p neo-diredy--center)
              (assq (window-buffer neo-diredy--center) neo-diredy--buffers))
     (set-window-margins neo-diredy--center (car neo-diredy--margins) (cdr neo-diredy--margins)))
   (remove-hook 'post-command-hook #'neo-diredy--post-command)
+  (remove-hook 'window-size-change-functions #'neo-diredy--details-resize)
   (dolist (command neo-diredy--layout-commands)
     (advice-remove command #'neo-diredy--before-layout-change))
   (when (timerp neo-diredy--timer) (cancel-timer neo-diredy--timer))
@@ -640,7 +1035,8 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
           (set-window-point (selected-window) position)))))
   ;; A plugin may reuse an auxiliary window after removing its dedication.
   ;; Release our navigation flag, but never delete a window it has taken over.
-  (dolist (entry (list (cons neo-diredy--left neo-diredy--parent)
+  (dolist (entry (list (cons neo-diredy--details-window neo-diredy--details-buffer)
+                       (cons neo-diredy--left neo-diredy--parent)
                        (cons neo-diredy--right neo-diredy--preview)))
     (let ((window (car entry)) (buffer (cdr entry)))
       (when (window-live-p window)
@@ -649,7 +1045,7 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
           (set-window-dedicated-p window nil)
           (unless (one-window-p t (window-frame window))
             (delete-window window))))))
-  (dolist (buffer (list neo-diredy--parent neo-diredy--preview))
+  (dolist (buffer (list neo-diredy--parent neo-diredy--preview neo-diredy--details-buffer))
     (when (buffer-live-p buffer) (kill-buffer buffer)))
   (dolist (entry neo-diredy--buffers)
     (when (and (caddr entry) (buffer-live-p (car entry)))
@@ -657,6 +1053,7 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
   (setq neo-diredy--buffers nil neo-diredy--overlays nil
         neo-diredy--windows nil neo-diredy--center nil
         neo-diredy--left nil neo-diredy--right nil neo-diredy--margins nil
+        neo-diredy--details-window nil neo-diredy--details-buffer nil
         neo-diredy--configuration nil neo-diredy--key nil
         neo-diredy--directory nil neo-diredy--timer nil
         neo-diredy--decorated nil neo-diredy--preview-key nil)
@@ -684,7 +1081,7 @@ All ordinary Dired operations remain available."
                   neo-diredy--configuration (current-window-configuration)
                   neo-diredy--center (selected-window)
                   neo-diredy--margins (window-margins))
-            (dolist (symbol '(neo-diredy--parent neo-diredy--preview))
+            (dolist (symbol '(neo-diredy--parent neo-diredy--preview neo-diredy--details-buffer))
               (set symbol (generate-new-buffer (format " *%s*" symbol)))
               (with-current-buffer (symbol-value symbol)
                 (special-mode)
@@ -707,6 +1104,7 @@ All ordinary Dired operations remain available."
                   (mapcar (lambda (window) (cons window (window-buffer window)))
                           (window-list nil 'no-minibuffer)))
             (add-hook 'post-command-hook #'neo-diredy--post-command)
+            (add-hook 'window-size-change-functions #'neo-diredy--details-resize)
             (dolist (command neo-diredy--layout-commands)
               (advice-add command :before #'neo-diredy--before-layout-change))
             (neo-diredy--refresh)))

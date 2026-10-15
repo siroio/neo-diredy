@@ -1,0 +1,333 @@
+;;; neo-diredy-details-tests.el --- Preview details checks -*- lexical-binding: t; -*-
+(unless (featurep 'neo-diredy)
+  (load (expand-file-name "neo-diredy-tests.el" (file-name-directory load-file-name)) nil t))
+(require 'ert)
+
+(ert-deftest neo-diredy-details-text-does-not-run-modes ()
+  (neo-diredy-test--with-directory
+   (let ((source (expand-file-name "example.py" root)) (ran nil))
+     (with-temp-file source (insert "print('hello')\n# Local Variables:\n# eval: (error \"unsafe\")\n# End:\n"))
+     (let ((python-mode-hook (list (lambda () (setq ran t)))))
+       (let ((data (neo-diredy--details-read source (file-attributes source))))
+         (should (equal (plist-get data :format) "Python"))
+         (should (equal (plist-get data :kind) 'text))
+         (should-not ran))))))
+
+(ert-deftest neo-diredy-details-utf16-is-text ()
+  (neo-diredy-test--with-directory
+   (let ((coding-system-for-write 'utf-16le-with-signature))
+     (with-temp-file file (insert "日本語\nhello\n")))
+   (let ((data (neo-diredy--details-read file (file-attributes file))))
+     (should (eq (plist-get data :kind) 'text))
+     (should (string-match-p "utf-16" (car (plist-get data :primary)))))))
+
+(ert-deftest neo-diredy-details-binary-signature-and-hex ()
+  (neo-diredy-test--with-directory
+   (let ((coding-system-for-write 'no-conversion))
+     (with-temp-file file (set-buffer-multibyte nil) (insert "\177ELF\0\0\0\0")))
+   (let ((data (neo-diredy--details-read file (file-attributes file))))
+     (should (eq (plist-get data :kind) 'binary))
+     (should (equal (plist-get data :format) "ELF"))
+     (should (string-prefix-p "7F 45 4C 46" (car (plist-get data :primary)))))))
+
+(ert-deftest neo-diredy-details-psd-canvas-not-thumbnail ()
+  (neo-diredy-test--with-directory
+   (let ((coding-system-for-write 'no-conversion))
+     (with-temp-file file
+       (set-buffer-multibyte nil)
+       (insert "8BPS" (unibyte-string 0 1 0 0 0 0 0 0 0 3 0 0 2 0 0 0 4 0 0 16 0 3))))
+   (let ((data (neo-diredy--details-read file (file-attributes file))))
+     (should (equal (plist-get data :format) "PSD"))
+     (should (member "1024 × 512" (plist-get data :primary)))
+     (should (member "16 bit/channel" (plist-get data :extra))))))
+
+(ert-deftest neo-diredy-details-media-excludes-cover-art ()
+  (let* ((json "{\"streams\":[{\"codec_type\":\"video\",\"width\":100,\"height\":100,\"disposition\":{\"attached_pic\":1}},{\"codec_type\":\"audio\",\"codec_name\":\"flac\",\"sample_rate\":\"48000\",\"channels\":2}],\"format\":{\"duration\":\"125.5\"}}")
+         (data (neo-diredy--details-media json '(:kind audio :format "FLAC"))))
+    (should (eq (plist-get data :kind) 'audio))
+    (should (member "2:05" (plist-get data :primary)))
+    (should (member "48000 Hz" (plist-get data :primary)))))
+
+(ert-deftest neo-diredy-details-footer-and-cleanup ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (dired-goto-file file)
+   (neo-diredy--refresh)
+   (should (window-live-p neo-diredy--details-window))
+   (should (<= (window-body-height neo-diredy--details-window) 3))
+   (should (>= (window-body-height neo-diredy--right) 6))
+   (should-not (buffer-local-value 'mode-line-format neo-diredy--preview))
+   (should (neo-diredy--layout-intact-p))
+   (let ((buffer neo-diredy--details-buffer))
+     (neo-diredy--layout-mode -1)
+     (should-not (buffer-live-p buffer))
+     (should (= 1 (length (window-list)))))))
+
+(ert-deftest neo-diredy-details-lines-fit ()
+  (let ((lines (neo-diredy--details-lines
+                '(:kind video :format "MP4" :size "1 MiB"
+                  :primary ("1920 × 1080" "2:05") :extra ("h264" "29.97 fps avg")
+                  :modified "2026-10-15 12:34") 24)))
+    (should (<= (length lines) 3))
+    (should (cl-every (lambda (line) (<= (string-width line) 24)) lines))
+    (should (string-match-p "MP4" (car lines)))))
+
+(ert-deftest neo-diredy-details-small-window-fallback ()
+  (neo-diredy-test--with-directory
+   (split-window nil 12 'below)
+   (neo-diredy--layout-mode 1)
+   (dired-goto-file file)
+   (neo-diredy--refresh)
+   (should-not (window-live-p neo-diredy--details-window))
+   (should (buffer-local-value 'mode-line-format neo-diredy--preview))
+   (should (>= (window-body-height neo-diredy--right) 6))
+   (should (neo-diredy--layout-intact-p))))
+
+(ert-deftest neo-diredy-details-reused-footer-is-preserved ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (let ((window neo-diredy--details-window)
+         (foreign (generate-new-buffer " *details-foreign*")))
+     (unwind-protect
+         (progn
+           (set-window-dedicated-p window nil)
+           (set-window-buffer window foreign)
+           (neo-diredy--post-command)
+           (should-not neo-diredy--layout-mode)
+           (should (window-live-p window))
+           (should (eq (window-buffer window) foreign))
+           (should-not (window-parameter window 'no-other-window)))
+       (kill-buffer foreign)))))
+
+(ert-deftest neo-diredy-details-resize-cycle ()
+  (skip-unless (display-graphic-p))
+  (let ((width (frame-width)) (height (frame-height)))
+    (unwind-protect
+        (neo-diredy-test--with-directory
+         (set-frame-size (selected-frame) 160 48)
+         (neo-diredy--layout-mode 1)
+         (should (window-live-p neo-diredy--details-window))
+         (dotimes (_ 2)
+           (set-frame-height (selected-frame) 14)
+           (neo-diredy--details-resize (selected-frame))
+           (should-not (window-live-p neo-diredy--details-window))
+           (should (buffer-local-value 'mode-line-format neo-diredy--preview))
+           (set-frame-height (selected-frame) 48)
+           (neo-diredy--details-resize (selected-frame))
+           (should (window-live-p neo-diredy--details-window))
+           (should (= 4 (length (window-list))))
+           (should-not (buffer-local-value 'mode-line-format neo-diredy--preview))
+           (should (neo-diredy--layout-intact-p))))
+      (set-frame-size (selected-frame) width height))))
+
+(defun neo-diredy-details-test--wav (file)
+  "Create a one second 8 kHz mono PCM fixture at FILE."
+  (let ((coding-system-for-write 'no-conversion))
+    (with-temp-file file
+      (set-buffer-multibyte nil)
+      (insert "RIFF" (unibyte-string 100 31 0 0) "WAVEfmt "
+              (unibyte-string 16 0 0 0 1 0 1 0 64 31 0 0 64 31 0 0 1 0 8 0)
+              "data" (unibyte-string 64 31 0 0) (make-string 8000 128)))))
+
+(ert-deftest neo-diredy-details-real-ffprobe-and-cache ()
+  (skip-unless (executable-find "ffprobe"))
+  (neo-diredy-test--with-directory
+   (let ((wave (expand-file-name "one second.wav" root)))
+     (neo-diredy-details-test--wav wave)
+     (revert-buffer)
+     (dired-goto-file wave)
+     (neo-diredy--layout-mode 1)
+     (let ((process neo-diredy--details-process))
+       (neo-diredy--details-resize (selected-frame))
+       (should (eq process neo-diredy--details-process)))
+     (let ((deadline (+ (float-time) 7)))
+       (while (and neo-diredy--details-process (< (float-time) deadline)) (accept-process-output nil 0.05)))
+     (should-not neo-diredy--details-process)
+     (should (member "0:01" (plist-get neo-diredy--details-data :primary)))
+     (should (member "8000 Hz" (plist-get neo-diredy--details-data :primary)))
+     (should (member "1 ch" (plist-get neo-diredy--details-data :primary)))
+     (dired-goto-file file)
+     (neo-diredy--refresh)
+     (cl-letf (((symbol-function 'make-process) (lambda (&rest _) (ert-fail "Reprobed cached file"))))
+       (dired-goto-file wave)
+       (neo-diredy--refresh)
+       (should (member "0:01" (plist-get neo-diredy--details-data :primary)))))))
+
+(ert-deftest neo-diredy-details-no-ffprobe-keeps-basic-info ()
+  (neo-diredy-test--with-directory
+   (let ((wave (expand-file-name "test.wav" root)))
+     (neo-diredy-details-test--wav wave)
+     (revert-buffer)
+     (dired-goto-file wave)
+     (cl-letf (((symbol-function 'executable-find) (lambda (_) nil)))
+       (neo-diredy--layout-mode 1)
+       (should (equal (plist-get neo-diredy--details-data :kind) 'audio))
+       (should (plist-get neo-diredy--details-data :size))
+       (should (member "ffprobe not installed" (plist-get neo-diredy--details-data :extra)))
+       (should-not neo-diredy--details-process)))))
+
+(ert-deftest neo-diredy-details-selection-cancels-probe ()
+  (skip-unless (executable-find "ffprobe"))
+  (neo-diredy-test--with-directory
+   (let ((wave (expand-file-name "test.wav" root)))
+     (neo-diredy-details-test--wav wave)
+     (revert-buffer)
+     (dired-goto-file wave)
+     (neo-diredy--layout-mode 1)
+     (let ((process neo-diredy--details-process))
+       (should process)
+       (dired-goto-file file)
+       (neo-diredy--post-command)
+       (should-not neo-diredy--details-process)
+       (should-not (process-live-p process))
+       (should-not (buffer-live-p (process-buffer process)))
+       (neo-diredy--refresh)
+       (neo-diredy--details-finished process "late callback")
+       (should (equal (plist-get neo-diredy--details-data :format) "Text"))))))
+
+(ert-deftest neo-diredy-details-static-image-has-no-fps ()
+  (let ((data (neo-diredy--details-media
+               "{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"webp\",\"width\":20,\"height\":10,\"avg_frame_rate\":\"25/1\"}],\"format\":{\"format_name\":\"webp_pipe\",\"duration\":\"0.04\"}}"
+               '(:kind image :format "WEBP (extension)"))))
+    (should-not (string-match-p "fps\\|0:00" (format "%S" data)))
+    (should (equal (plist-get data :format) "WEBP"))))
+
+(ert-deftest neo-diredy-details-utf32-bom ()
+  (neo-diredy-test--with-directory
+   (dolist (bytes (list (unibyte-string 255 254 0 0 65 0 0 0 13 0 0 0 10 0 0 0)
+                       (unibyte-string 0 0 254 255 0 0 0 65 0 0 0 13 0 0 0 10)))
+     (let ((coding-system-for-write 'no-conversion))
+       (with-temp-file file (set-buffer-multibyte nil) (insert bytes)))
+     (let ((data (neo-diredy--details-read file (file-attributes file))))
+       (should (eq (plist-get data :kind) 'text))
+       (should (string-prefix-p "UTF-32" (car (plist-get data :primary))))
+       (should (member "CRLF" (plist-get data :primary))))
+     (neo-diredy--layout-mode 1)
+     (dired-goto-file file)
+     (neo-diredy--refresh)
+     (should (string-prefix-p "A" (with-current-buffer neo-diredy--preview (buffer-string))))
+     (neo-diredy--layout-mode -1))))
+
+(ert-deftest neo-diredy-details-hex-adapts-to-width ()
+  (neo-diredy-test--with-directory
+   (let ((coding-system-for-write 'no-conversion))
+     (with-temp-file file (set-buffer-multibyte nil) (insert (make-string 20 0))))
+   (let ((data (neo-diredy--details-read file (file-attributes file))))
+     (should (= 47 (length (nth 1 (neo-diredy--details-lines data 60)))))
+     (should (= 23 (length (nth 1 (neo-diredy--details-lines data 25))))))))
+
+(ert-deftest neo-diredy-details-container-family ()
+  (let ((data (neo-diredy--details-media
+               "{\"streams\":[{\"codec_type\":\"video\",\"width\":1920,\"height\":1080}],\"format\":{\"format_name\":\"mov,mp4,m4a,3gp,3g2,mj2\"}}"
+               '(:kind video :format "MP4 (extension)"))))
+    (should (equal (plist-get data :format) "MOV/MP4"))))
+
+(ert-deftest neo-diredy-details-probe-failure-bounds ()
+  (neo-diredy-test--with-directory
+   (let ((wave (expand-file-name "test.wav" root))
+         (make (symbol-function 'make-process))
+         (timer (symbol-function 'run-at-time)))
+     (neo-diredy-details-test--wav wave)
+     (revert-buffer)
+     (dired-goto-file wave)
+     (dolist (code '("(princ (make-string 70000 120))" "(sleep-for 60)"))
+       (cl-letf (((symbol-function 'executable-find) (lambda (_) "test-ffprobe"))
+                 ((symbol-function 'make-process)
+                  (lambda (&rest args)
+                    (apply make (plist-put args :command
+                                           (list (expand-file-name invocation-name invocation-directory)
+                                                 "-Q" "--batch" "--eval" code)))))
+                 ((symbol-function 'run-at-time)
+                  (lambda (seconds repeat function &rest args)
+                    (apply timer (if (equal seconds 5) 0.4 seconds) repeat function args))))
+         (neo-diredy--layout-mode 1)
+         (let ((process neo-diredy--details-process) (deadline (+ (float-time) 4)))
+           (while (and neo-diredy--details-process (< (float-time) deadline)) (accept-process-output nil 0.05))
+           (should-not neo-diredy--details-process)
+           (should-not (buffer-live-p (process-buffer process)))
+           (should (member "Details unavailable" (plist-get neo-diredy--details-data :extra)))
+           (should (assoc neo-diredy--details-key neo-diredy--details-cache)))
+         (neo-diredy--layout-mode -1))))))
+
+(ert-deftest neo-diredy-details-corrupt-media-and-start-error ()
+  (neo-diredy-test--with-directory
+   (let ((wave (expand-file-name "broken.wav" root)))
+     (with-temp-file wave (insert "Not a wave"))
+     (revert-buffer)
+     (dired-goto-file wave)
+     (cl-letf (((symbol-function 'executable-find) (lambda (_) "nonexistent-diredy-probe-executable")))
+       (neo-diredy--layout-mode 1)
+       (should-not neo-diredy--details-process)
+       (should (member "Details unavailable" (plist-get neo-diredy--details-data :extra))))
+     (neo-diredy--layout-mode -1)
+     (when (executable-find "ffprobe")
+       (neo-diredy--layout-mode 1)
+       (let ((deadline (+ (float-time) 7)))
+         (while (and neo-diredy--details-process (< (float-time) deadline)) (accept-process-output nil 0.05)))
+       (should-not neo-diredy--details-process)
+       (should (member "Details unavailable" (plist-get neo-diredy--details-data :extra)))))))
+
+(ert-deftest neo-diredy-details-real-video ()
+  (skip-unless (and (executable-find "ffmpeg") (executable-find "ffprobe")))
+  (neo-diredy-test--with-directory
+   (let ((video (expand-file-name "video.mp4" root)))
+     (should (= 0 (call-process "ffmpeg" nil nil nil "-v" "error" "-f" "lavfi" "-i"
+                               "color=c=black:s=32x24:r=10" "-t" "0.5" "-an" "-c:v" "mpeg4"
+                               "-threads" "1" video)))
+     (revert-buffer)
+     (dired-goto-file video)
+     (neo-diredy--layout-mode 1)
+     (let ((deadline (+ (float-time) 7)))
+       (while (and neo-diredy--details-process (< (float-time) deadline)) (accept-process-output nil 0.05)))
+     (should (member "32 × 24" (plist-get neo-diredy--details-data :primary)))
+     (should (member "10.00 fps avg" (plist-get neo-diredy--details-data :extra)))
+     (should (member "mpeg4" (plist-get neo-diredy--details-data :extra)))
+     (should (equal "MOV/MP4" (plist-get neo-diredy--details-data :format))))))
+
+(ert-deftest neo-diredy-details-theme-modelines-and-visible-lines ()
+  (skip-unless (display-graphic-p))
+  (let ((themes custom-enabled-themes))
+    (unwind-protect
+        (neo-diredy-test--with-directory
+         (load-theme 'modus-vivendi t)
+         (neo-diredy--layout-mode 1)
+         (redisplay t)
+         (neo-diredy--refresh)
+         (redisplay t)
+         (should (= 3 (window-body-height neo-diredy--details-window)))
+         (should (= 0 (window-mode-line-height neo-diredy--right)))
+         (let ((windows (list neo-diredy--left neo-diredy--center neo-diredy--details-window)))
+           (should (apply #'= (mapcar #'window-mode-line-height windows)))
+           (should (apply #'= (mapcar (lambda (w) (nth 3 (window-pixel-edges w))) windows)))))
+      (mapc #'disable-theme custom-enabled-themes)
+      (mapc #'enable-theme (reverse themes)))))
+
+(ert-deftest neo-diredy-details-pixel-budget-does-not-retry-split ()
+  (neo-diredy-test--with-directory
+   (let ((split (symbol-function 'split-window))
+         (pixels (symbol-function 'window-pixel-height)) (attempts 0))
+     ;; A 256 pixel column permits 64 pixels; the themed footer needs 66.
+     (cl-letf (((symbol-function 'frame-char-height) (lambda (&optional _) 16))
+               ((symbol-function 'window-mode-line-height) (lambda (&optional _) 18))
+               ((symbol-function 'window-pixel-height)
+                (lambda (&optional window) (if (eq window neo-diredy--right) 256 (funcall pixels window))))
+               ((symbol-function 'split-window)
+                (lambda (&optional window size side pixelwise)
+                  (when (eq side 'below) (cl-incf attempts))
+                  (funcall split window size side pixelwise))))
+       (neo-diredy--layout-mode 1)
+       (dotimes (_ 3) (neo-diredy--refresh))
+       (should (= attempts 0))
+       (should-not (window-live-p neo-diredy--details-window))))))
+
+(ert-deftest neo-diredy-details-png-depth-is-sample-depth ()
+  (neo-diredy-test--with-directory
+   (let ((coding-system-for-write 'no-conversion))
+     (with-temp-file file
+       (set-buffer-multibyte nil)
+       (insert (unibyte-string 137 80 78 71 13 10 26 10 0 0 0 13) "IHDR"
+               (unibyte-string 0 0 0 32 0 0 0 24 8 3))))
+   (let ((data (neo-diredy--details-read file (file-attributes file))))
+     (should (member "32 × 24" (plist-get data :primary)))
+     ;; Indexed PNG stores palette indices, not an eight-bit color channel.
+     (should (member "8 bit/sample" (plist-get data :extra))))))

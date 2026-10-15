@@ -85,6 +85,26 @@ https://github.com/siroio/neo-diredy
 
 画像はEmacsが対応している形式で表示します。大きい画像、未対応形式、バイナリファイルでは概要を表示します。同じファイルを再表示するときは、更新日時・サイズ・表示寸法などが変わらない限り読み直しません。外部で更新した内容を明示的に取り直すにはDiredの再読込 (`g`) を使います。
 
+### 下部の詳細情報
+
+右ペインの下部に、プレビューとは独立した最大3行の情報欄を表示します。画像や本文には重ねません。情報欄はmode-lineを含めて右ペインの高さの1/4以内に抑え、本文を最低6行確保できない画面ではmode-lineの1行表示へ縮めます。画面サイズ変更にも追従し、最下端のmode-lineは左・中央と揃えます。
+
+| 種類 | 主な情報 |
+| --- | --- |
+| 画像 | 形式・元画像の寸法・取得できる場合は色深度 |
+| 動画 | コンテナ形式・寸法・長さ・コーデック・平均fps |
+| 音源 | コンテナ形式・長さ・サンプルレート・チャンネル数・コーデック |
+| バイナリ | 判別できた形式・先頭16バイトの16進表示（狭い欄では8バイト） |
+| テキスト | 拡張子・shebangから推定した言語、文字コード、改行形式 |
+
+共通でファイルサイズと更新日時を表示します。幅が足りない場合は項目単位で省略し、形式・サイズと種類ごとの主要情報を優先します。小さい画面の1行表示は形式・サイズのみです。PSD/PSBはヘッダーの元キャンバス寸法、CLIPは抽出した画像の寸法を `Preview` と明記します。
+
+ヘッダー・文字コード判定の読込は先頭64 KiBまでです。BOMがない文字コードは `(guess)`、一部だけ読んだ改行判定は `(sample)` と表示します。言語判定で編集モードやファイル内のコードを実行しません。BOM付きUTF-32は本文プレビューにも対応します。
+
+動画・音源と一部画像の詳細には、PATH上の `ffprobe` があれば使用します。追加インストールは自動では行いません。ない場合は基本情報のみ表示し、`ffprobe not installed` と案内します。動画・音源の再生機能はありません。
+
+取得は非同期で、同時に1プロセス、5秒、出力64 KiBまでです。選択変更や画面終了時に中止し、古い選択の結果は表示しません。結果はファイルのサイズ・更新日時などをキーに最大32件保持し、画面サイズ変更では再取得しません。`g` での再読込とレイアウト終了時にキャッシュを解放します。破損ファイルやタイムアウトでは、基本情報を残して `Details unavailable` と表示します。
+
 ### CLIP・PSD・PSB
 
 GUI版Emacsでは、これらのファイルを選ぶと右ペインに保存済みの画像を表示します。ImageMagick、Python、Dirvish、Dired Previewの追加導入は不要です。
@@ -111,6 +131,7 @@ emacs -Q --batch -l tests/neo-diredy-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-art-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-metadata-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-interop-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-details-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/check-package.el
 emacs -Q --batch -l benchmarks/run.el
 ```

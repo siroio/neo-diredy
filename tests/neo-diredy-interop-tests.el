@@ -124,7 +124,7 @@
            (set-window-configuration original)
            (run-hooks 'post-command-hook)
            (should neo-diredy--layout-mode)
-           (should (= 3 (length (window-list)))))
+           (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list)))))
        (neo-diredy-mode -1)
        (kill-buffer popup)))))
 
@@ -151,7 +151,7 @@
                (should (eq (current-buffer) source))
                (run-hooks 'post-command-hook)
                (should neo-diredy--layout-mode)
-               (should (= 3 (length (window-list)))))
+               (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list)))))
            (neo-diredy-mode -1)
            (when (buffer-live-p plugin) (kill-buffer plugin))))))))
 
@@ -184,7 +184,7 @@
            (quit-window nil (get-buffer-window "*Help*"))
            (run-hooks 'post-command-hook)
            (should neo-diredy--layout-mode)
-           (should (= 3 (length (window-list)))))
+           (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list)))))
        (neo-diredy-mode -1)
        (when (and (not old-help) (get-buffer "*Help*")) (kill-buffer "*Help*"))))))
 
@@ -272,7 +272,7 @@
            (should-not neo-diredy--layout-mode)
            (execute-kbd-macro [f7])
            (should neo-diredy--layout-mode)
-           (should (= 3 (length (window-list)))))
+           (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list)))))
        (neo-diredy-mode -1)
        (kill-buffer popup)))))
 
@@ -417,7 +417,7 @@
            (execute-kbd-macro (kbd "q"))
            (should (eq (window-buffer) source))
            (should neo-diredy--layout-mode)
-           (should (= 3 (length (window-list)))))
+           (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list)))))
        (neo-diredy-mode -1)
        (when (buffer-live-p owner)
          (with-current-buffer owner
