@@ -1,0 +1,265 @@
+;;; check-dired-yazi.el --- Isolated layout checks -*- lexical-binding: t; -*-
+;; Run: emacs -Q --batch -l check-dired-yazi.el
+(require 'ert)
+(require 'dired)
+(add-to-list 'load-path (expand-file-name ".." (file-name-directory load-file-name)))
+(require 'neo-diredy nil t)
+(defconst neo-diredy-test-root (file-name-directory load-file-name))
+
+(when (fboundp 'neo-diredy-mode) (neo-diredy-mode -1))
+
+(defmacro neo-diredy-test--with-directory (&rest body)
+  `(let* ((temporary-file-directory neo-diredy-test-root)
+          (root (make-temp-file "yazi-test-" t))
+          (child (expand-file-name "child" root))
+          (file (expand-file-name "hello.txt" root))
+          (original (current-window-configuration)))
+     (unwind-protect
+         (progn
+           (make-directory child)
+           (with-temp-file file (insert "hello preview\n"))
+           (delete-other-windows)
+           (dired root)
+           ,@body)
+       (when (bound-and-true-p neo-diredy--layout-mode) (neo-diredy--layout-mode -1))
+       (set-window-configuration original)
+       (dolist (buffer (buffer-list))
+         (when (with-current-buffer buffer
+                 (string-prefix-p (file-name-as-directory root) default-directory))
+           (with-current-buffer buffer (set-buffer-modified-p nil))
+           (kill-buffer buffer)))
+       (delete-directory root t))))
+
+(ert-deftest neo-diredy-tab-clones-current-directory ()
+  (neo-diredy-test--with-directory
+   (let ((dired-kill-when-opening-new-dired-buffer nil))
+     (neo-diredy--layout-mode 1)
+     (dired-goto-file child)
+     (dired-find-file)
+     (neo-diredy--post-command)
+     (unwind-protect
+         (progn
+           (tab-new)
+           (should (equal (file-name-as-directory child) default-directory)))
+       (tab-close)))))
+
+(ert-deftest neo-diredy-link-metadata-uses-target ()
+  (neo-diredy-test--with-directory
+   (let* ((target (expand-file-name "target.txt" root))
+          (attributes (file-attributes file))
+          (real-attributes (symbol-function 'file-attributes)))
+     (with-temp-file target (insert (make-string 150 ?x)))
+     (setcar attributes target)
+     (cl-letf (((symbol-function 'file-attributes)
+                (lambda (path &optional format)
+                  (if (equal path file) attributes (funcall real-attributes path format))))
+               ((symbol-function 'file-truename) (lambda (_) target)))
+       (should (= 150 (file-attribute-size (cdr (neo-diredy--file-info file)))))
+       (should (equal target (car (neo-diredy--file-info file))))))))
+
+(ert-deftest neo-diredy-remote-transition-stops-layout ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (cl-letf (((symbol-function 'file-remote-p) (lambda (&rest _) t)))
+     (neo-diredy--post-command)
+     (should-not neo-diredy--layout-mode)
+     (should (derived-mode-p 'dired-mode)))))
+
+(ert-deftest neo-diredy-symlink-target-invalidates-preview ()
+  (neo-diredy-test--with-directory
+   (let ((link (expand-file-name "link.txt" root)))
+     (condition-case err (make-symbolic-link file link)
+       (file-error (ert-skip (format "Symlink unavailable: %s" err))))
+     (revert-buffer)
+     (neo-diredy--layout-mode 1)
+     (dired-goto-file link)
+     (neo-diredy--refresh)
+     (with-temp-file file (insert "changed symlink target"))
+     (neo-diredy--refresh)
+     (should (string-match-p "changed symlink target"
+                             (with-current-buffer neo-diredy--preview (buffer-string)))))))
+
+(ert-deftest neo-diredy-marks-reuse-decoration ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (let ((overlays (copy-sequence neo-diredy--overlays)))
+     (dired-goto-file file)
+     (dired-mark 1)
+     (neo-diredy--style)
+     (should (equal overlays neo-diredy--overlays))
+     (should (string-match-p "1 marked" (neo-diredy--status)))
+     (dired-goto-file file)
+     (dired-unmark 1)
+     (should (string-match-p "0 marked" (neo-diredy--status))))))
+
+(ert-deftest neo-diredy-repeat-preview-does-not-read-again ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (dired-goto-file file)
+   (neo-diredy--refresh)
+   (cl-letf (((symbol-function 'insert-file-contents)
+              (lambda (&rest _) (ert-fail "Unchanged preview read twice"))))
+     (neo-diredy--refresh)
+     (should (string-match-p "hello preview" (with-current-buffer neo-diredy--preview (buffer-string)))))
+   (with-temp-file file (insert "updated preview with new contents"))
+   (neo-diredy--refresh)
+   (should (string-match-p "updated preview" (with-current-buffer neo-diredy--preview (buffer-string))))))
+
+(ert-deftest neo-diredy-revert-updates-listing ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (let ((added (expand-file-name "new.txt" root)))
+     (with-temp-file added (insert "new file"))
+     (revert-buffer)
+     (neo-diredy--post-command)
+     (should (dired-goto-file added))
+     (should (cl-some (lambda (overlay)
+                        (and (eq (overlay-buffer overlay) (current-buffer))
+                             (= (overlay-start overlay) (point))
+                             (overlay-get overlay 'before-string)))
+                      neo-diredy--overlays)))))
+
+(ert-deftest neo-diredy-auto-open-and-disable ()
+  (neo-diredy-test--with-directory
+   (unwind-protect
+       (progn
+         (neo-diredy-mode 1)
+         (should neo-diredy--layout-mode)
+         (neo-diredy--layout-mode -1)
+         (dired child)
+         (should neo-diredy--layout-mode)
+         (should (= 3 (length (window-list))))
+         (neo-diredy-mode -1)
+         (dired root)
+         (should-not neo-diredy--layout-mode)
+         (should (= 1 (length (window-list)))))
+     (neo-diredy-mode -1))))
+
+(ert-deftest neo-diredy-test-layout-and-restore ()
+  (neo-diredy-test--with-directory
+   (let ((source (current-buffer))
+         (details dired-hide-details-mode)
+         (header header-line-format))
+     (neo-diredy--layout-mode 1)
+     (should (= 3 (length (window-list))))
+     (should (eq source (window-buffer neo-diredy--center)))
+     (should dired-hide-details-mode)
+     (dired-goto-file file)
+     (neo-diredy--refresh)
+     (should (string-match-p "hello preview" (with-current-buffer neo-diredy--preview (buffer-string))))
+     (neo-diredy--layout-mode -1)
+     (should (= 1 (length (window-list))))
+     (should (eq source (current-buffer)))
+     (should (eq details dired-hide-details-mode))
+     (should (equal header header-line-format)))))
+
+(ert-deftest neo-diredy-test-navigation-and-marks ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (dired-goto-file file)
+   (dired-mark 1)
+   (should (member file (dired-get-marked-files)))
+   (dired-goto-file child)
+   (dired-find-file)
+   (neo-diredy--refresh)
+   (should (equal (file-name-as-directory child) default-directory))
+   (should dired-hide-details-mode)
+   (should (= 3 (length (window-list))))
+   (dired-up-directory)
+   (neo-diredy--refresh)
+   (should (equal (file-name-as-directory root) default-directory))))
+
+(ert-deftest neo-diredy-test-preview-is-not-a-visited-file ()
+  (neo-diredy-test--with-directory
+   (let ((visited (find-file-noselect file)))
+     (with-current-buffer visited (goto-char (point-max)) (insert "unsaved"))
+     (neo-diredy--layout-mode 1)
+     (dired-goto-file file)
+     (neo-diredy--refresh)
+     (with-current-buffer neo-diredy--preview
+       (should-not buffer-file-name)
+       (should buffer-read-only))
+     (neo-diredy--layout-mode -1)
+     (should (buffer-live-p visited))
+     (should (buffer-modified-p visited)))))
+
+(ert-deftest neo-diredy-test-preview-bounds-and-binary ()
+  (neo-diredy-test--with-directory
+   (with-temp-file file (insert (make-string 200 ?x)))
+   (let ((neo-diredy-preview-bytes 32))
+     (neo-diredy--layout-mode 1)
+     (dired-goto-file file)
+     (neo-diredy--refresh)
+     (should (< (with-current-buffer neo-diredy--preview (buffer-size)) 150))
+     (with-temp-file file (insert "binary\0data"))
+     (neo-diredy--refresh)
+     (should (string-match-p "Binary" (with-current-buffer neo-diredy--preview (buffer-string)))))))
+
+(ert-deftest neo-diredy-test-file-open-exits-layout ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (dired-goto-file file)
+   (dired-find-file)
+   (neo-diredy--post-command)
+   (should-not neo-diredy--layout-mode)
+   (should (= 1 (length (window-list))))
+   (should (equal file buffer-file-name))))
+
+(ert-deftest neo-diredy-test-manual-layout-change ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (let ((preview neo-diredy--preview))
+     (delete-other-windows)
+     (neo-diredy--post-command)
+     (should-not neo-diredy--layout-mode)
+     (should-not (buffer-live-p preview))
+     (should (= 1 (length (window-list)))))))
+
+(ert-deftest neo-diredy-test-tab-change-does-not-replace-new-tab ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (tab-new)
+   (switch-to-buffer (get-buffer-create "*yazi-other-tab*"))
+   (neo-diredy--post-command)
+   (should-not neo-diredy--layout-mode)
+   (should (equal "*yazi-other-tab*" (buffer-name)))
+   (tab-close)
+   (should (= 1 (length (window-list))))
+   (kill-buffer "*yazi-other-tab*")))
+
+(ert-deftest neo-diredy-test-enable-twice-is-idempotent ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (neo-diredy--layout-mode 1)
+   (should (= 3 (length (window-list))))))
+
+(ert-deftest neo-diredy-test-directory-style-is-synchronous ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (neo-diredy--post-command)
+   (dired-goto-file child)
+   (dired-find-file)
+   (neo-diredy--post-command)
+   ;; No idle timer/redisplay wait should be necessary for directory styling.
+   (should dired-hide-details-mode)
+   (should (eq (overlay-get hl-line-overlay 'face) 'neo-diredy-selection))
+   (should (equal default-directory neo-diredy--directory))))
+
+(ert-deftest neo-diredy-test-navigation-with-buffer-replacement ()
+  (neo-diredy-test--with-directory
+   (let ((dired-kill-when-opening-new-dired-buffer t))
+     (neo-diredy--layout-mode 1)
+     (dired-goto-file child)
+     (dired-find-file)
+     (neo-diredy--refresh)
+     (neo-diredy--layout-mode -1)
+     (should (derived-mode-p 'dired-mode))
+     (should (equal (file-name-as-directory child) default-directory)))))
+
+(ert-deftest neo-diredy-test-partial-window-deletion-cleans-owned-pane ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (delete-window neo-diredy--left)
+   (neo-diredy--post-command)
+   (should-not neo-diredy--layout-mode)
+   (should (= 1 (length (window-list))))))

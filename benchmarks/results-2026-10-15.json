@@ -1,0 +1,193 @@
+{
+  "date": "2026-10-15",
+  "before": [
+    {
+      "emacs": "31.1",
+      "source_sha256": "69cec1907367ca9c36bbda73fa9a99d65e1768de86d824b3cdda653890b04632",
+      "entries": 2100,
+      "results": {
+        "cursor_200": {
+          "seconds": 0.018198,
+          "gcs": 0
+        },
+        "status_1000": {
+          "seconds": 0.387071,
+          "gcs": 0
+        },
+        "marks_40": {
+          "seconds": 0.951011,
+          "gcs": 15
+        },
+        "listing_10": {
+          "seconds": 1.536351,
+          "gcs": 2
+        },
+        "repeat_preview_100": {
+          "seconds": 0.076144,
+          "gcs": 0
+        },
+        "source_tree_open_close_10": {
+          "seconds": 0.055181,
+          "gcs": 0
+        }
+      }
+    },
+    {
+      "emacs": "31.1",
+      "source_sha256": "69cec1907367ca9c36bbda73fa9a99d65e1768de86d824b3cdda653890b04632",
+      "entries": 2100,
+      "results": {
+        "cursor_200": {
+          "seconds": 0.018468,
+          "gcs": 0
+        },
+        "status_1000": {
+          "seconds": 0.39083,
+          "gcs": 0
+        },
+        "marks_40": {
+          "seconds": 0.941362,
+          "gcs": 15
+        },
+        "listing_10": {
+          "seconds": 1.342574,
+          "gcs": 2
+        },
+        "repeat_preview_100": {
+          "seconds": 0.069766,
+          "gcs": 0
+        },
+        "source_tree_open_close_10": {
+          "seconds": 0.050916,
+          "gcs": 0
+        }
+      }
+    },
+    {
+      "emacs": "31.1",
+      "source_sha256": "69cec1907367ca9c36bbda73fa9a99d65e1768de86d824b3cdda653890b04632",
+      "entries": 2100,
+      "results": {
+        "cursor_200": {
+          "seconds": 0.018664,
+          "gcs": 0
+        },
+        "status_1000": {
+          "seconds": 0.382687,
+          "gcs": 0
+        },
+        "marks_40": {
+          "seconds": 0.946483,
+          "gcs": 15
+        },
+        "listing_10": {
+          "seconds": 1.585414,
+          "gcs": 2
+        },
+        "repeat_preview_100": {
+          "seconds": 0.070699,
+          "gcs": 0
+        },
+        "source_tree_open_close_10": {
+          "seconds": 0.051671,
+          "gcs": 0
+        }
+      }
+    }
+  ],
+  "after": [
+    {
+      "emacs": "31.1",
+      "source_sha256": "8cc09294c081190ee8b33425ff2731b6981d1b5794ab2d9b38e3da2bb7279240",
+      "entries": 2100,
+      "results": {
+        "cursor_200": {
+          "seconds": 0.018725,
+          "gcs": 0
+        },
+        "status_1000": {
+          "seconds": 0.005911,
+          "gcs": 0
+        },
+        "marks_40": {
+          "seconds": 0.000923,
+          "gcs": 0
+        },
+        "listing_10": {
+          "seconds": 1.224363,
+          "gcs": 2
+        },
+        "repeat_preview_100": {
+          "seconds": 0.014605,
+          "gcs": 0
+        },
+        "source_tree_open_close_10": {
+          "seconds": 0.045776,
+          "gcs": 0
+        }
+      }
+    },
+    {
+      "emacs": "31.1",
+      "source_sha256": "8cc09294c081190ee8b33425ff2731b6981d1b5794ab2d9b38e3da2bb7279240",
+      "entries": 2100,
+      "results": {
+        "cursor_200": {
+          "seconds": 0.020333,
+          "gcs": 0
+        },
+        "status_1000": {
+          "seconds": 0.005954999999999999,
+          "gcs": 0
+        },
+        "marks_40": {
+          "seconds": 0.000902,
+          "gcs": 0
+        },
+        "listing_10": {
+          "seconds": 1.314877,
+          "gcs": 2
+        },
+        "repeat_preview_100": {
+          "seconds": 0.014146,
+          "gcs": 0
+        },
+        "source_tree_open_close_10": {
+          "seconds": 0.045563,
+          "gcs": 0
+        }
+      }
+    },
+    {
+      "emacs": "31.1",
+      "source_sha256": "8cc09294c081190ee8b33425ff2731b6981d1b5794ab2d9b38e3da2bb7279240",
+      "entries": 2100,
+      "results": {
+        "cursor_200": {
+          "seconds": 0.019384000000000002,
+          "gcs": 0
+        },
+        "status_1000": {
+          "seconds": 0.0059559999999999995,
+          "gcs": 0
+        },
+        "marks_40": {
+          "seconds": 0.000843,
+          "gcs": 0
+        },
+        "listing_10": {
+          "seconds": 1.22539,
+          "gcs": 2
+        },
+        "repeat_preview_100": {
+          "seconds": 0.013314000000000001,
+          "gcs": 0
+        },
+        "source_tree_open_close_10": {
+          "seconds": 0.047197,
+          "gcs": 0
+        }
+      }
+    }
+  ]
+}

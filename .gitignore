@@ -1,0 +1,5 @@
+*.elc
+*~
+.bench/
+tests/yazi-test-*/
+neo-diredy-*.tar
