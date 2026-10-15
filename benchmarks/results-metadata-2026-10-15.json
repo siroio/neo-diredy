@@ -1,0 +1,35 @@
+{
+  "emacs": "31.1",
+  "source_sha256": "59d8114753409dd98973f9f6d15f6f1c6bf4971bac79c9f661c2e23439f158a2",
+  "entries": 2100,
+  "results": {
+    "cursor_200": {
+      "seconds": 0.019368,
+      "gcs": 0
+    },
+    "status_1000": {
+      "seconds": 0.01283,
+      "gcs": 0
+    },
+    "marks_40": {
+      "seconds": 0.000911,
+      "gcs": 0
+    },
+    "listing_10": {
+      "seconds": 1.335897,
+      "gcs": 2
+    },
+    "repeat_preview_100": {
+      "seconds": 0.017436,
+      "gcs": 0
+    },
+    "large_tree_open_close_3": {
+      "seconds": 0.630663,
+      "gcs": 4
+    },
+    "source_tree_open_close_10": {
+      "seconds": 0.209379,
+      "gcs": 0
+    }
+  }
+}

@@ -49,6 +49,10 @@
         (push (cons 'repeat_preview_100
                     (neo-diredy-bench-measure 100 #'neo-diredy--refresh)) results)
         (neo-diredy--layout-mode -1)
+        (push (cons 'large_tree_open_close_3
+                    (neo-diredy-bench-measure
+                     3 (lambda () (neo-diredy--layout-mode 1)
+                          (neo-diredy--layout-mode -1)))) results)
         ;; Real source-tree workload, read-only; no user configuration is loaded.
         (let ((source-dir (expand-file-name "../emacs.d/lisp" neo-diredy-bench-root)))
           (when (file-directory-p source-dir)
