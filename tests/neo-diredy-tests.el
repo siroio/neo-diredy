@@ -33,6 +33,37 @@
            (kill-buffer buffer)))
        (delete-directory root t))))
 
+(ert-deftest neo-diredy-icon-selection-follows-row ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (cl-labels
+       ((check-icons (selected)
+          (dolist (overlay neo-diredy--overlays)
+            (when-let* ((path (overlay-get overlay 'neo-diredy-file)))
+              (let* ((text (overlay-get overlay 'before-string))
+                     (start (- (length text) 2)))
+                ;; Both the glyph and its trailing space must match the row.
+                (dolist (index (list start (1+ start)))
+                  (let ((face (get-text-property index 'face text)))
+                    (should (eq (and (listp face) (memq 'neo-diredy-selection face) t)
+                                (equal path selected))))))))))
+     (dolist (selected (list child file child))
+       (dired-goto-file selected)
+       (neo-diredy--post-command)
+       (check-icons selected)
+       (neo-diredy--metadata-paint)
+       (check-icons selected))
+     (revert-buffer nil t)
+     (neo-diredy--post-command)
+     (check-icons (dired-get-filename))
+     (dired-goto-file file)
+     (wdired-change-to-wdired-mode)
+     (neo-diredy--post-command)
+     (insert "renamed-")
+     (neo-diredy--post-command)
+     (check-icons file)
+     (wdired-abort-changes))))
+
 (ert-deftest neo-diredy-tab-clones-current-directory ()
   (neo-diredy-test--with-directory
    (let ((dired-kill-when-opening-new-dired-buffer nil))

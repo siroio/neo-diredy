@@ -57,6 +57,7 @@
   "Selection and window contents held until navigation after a handoff.")
 (defvar neo-diredy--buffers nil)
 (defvar neo-diredy--overlays nil)
+(defvar neo-diredy--selected-icon nil)
 (defvar neo-diredy--timer nil)
 (defvar neo-diredy--key nil)
 (defvar neo-diredy--directory nil)
@@ -95,6 +96,26 @@ Advising its layout function does not load or require the optional package.")
   "Return a simple label for a file of type DIRECTORY."
   (propertize (if directory "▸ " "· ")
               'face (if directory 'dired-directory 'shadow)))
+
+(defun neo-diredy--highlight-icon ()
+  "Match the current row's icon background without repainting the listing."
+  ;; Overlay before-strings do not inherit the hl-line overlay's face.
+  (let ((selected (cl-find-if
+                   (lambda (overlay) (overlay-get overlay 'neo-diredy-file))
+                   (overlays-in (line-beginning-position)
+                                (min (point-max) (1+ (line-end-position)))))))
+    (dolist (overlay (delete-dups (list neo-diredy--selected-icon selected)))
+      (when (and (overlayp overlay) (overlay-buffer overlay))
+        (let* ((text (copy-sequence (overlay-get overlay 'before-string)))
+               (face (if (overlay-get overlay 'neo-diredy-directory)
+                         'dired-directory 'shadow)))
+          ;; The right-margin display precedes the two-character icon.
+          (put-text-property (- (length text) 2) (length text) 'face
+                             (if (eq overlay selected)
+                                 (list 'neo-diredy-selection face) face)
+                             text)
+          (overlay-put overlay 'before-string text))))
+    (setq neo-diredy--selected-icon selected)))
 
 (defun neo-diredy--changed (begin end old-length)
   "Invalidate decoration for listing edits, but not single-column marks."
@@ -187,6 +208,7 @@ Advising its layout function does not load or require the optional package.")
 		(push overlay neo-diredy--overlays))))
 	  (forward-line 1))))
     (neo-diredy--metadata-paint))
+  (neo-diredy--highlight-icon)
   (neo-diredy--modeline-sync))
 
 (defun neo-diredy--protect-margins (original window left &optional right)
@@ -322,6 +344,11 @@ Advising its layout function does not load or require the optional package.")
           (overlay-put overlay 'before-string
                        (concat (propertize " " 'display `((margin right-margin) ,label))
                                (neo-diredy--icon file (overlay-get overlay 'neo-diredy-directory))))))))
+  (when (window-live-p neo-diredy--center)
+    (with-current-buffer (window-buffer neo-diredy--center)
+      (save-excursion
+        (goto-char (window-point neo-diredy--center))
+        (neo-diredy--highlight-icon))))
   (neo-diredy--details-paint)
   (force-mode-line-update))
 
@@ -1173,6 +1200,7 @@ Keep these volatile fields out of the file-content cache."
     (when (and (caddr entry) (buffer-live-p (car entry)))
       (with-current-buffer (car entry) (dired-preview-mode 1))))
   (setq neo-diredy--buffers nil neo-diredy--overlays nil
+        neo-diredy--selected-icon nil
         neo-diredy--windows nil neo-diredy--center nil
         neo-diredy--left nil neo-diredy--right nil neo-diredy--margins nil
         neo-diredy--details-window nil neo-diredy--details-buffer nil
