@@ -11,6 +11,7 @@
 ;; Dired and all other required libraries are bundled with Emacs.
 ;; One layout at a time.  The center remains an ordinary Dired buffer.
 ;; Auxiliary buffers never visit files or run their local variables/hooks.
+;; Preview fontification uses isolated, hook-free language modes.
 
 ;;; Code:
 (require 'cl-lib)
@@ -18,6 +19,7 @@
 (require 'subr-x)
 (require 'dired)
 (require 'hl-line)
+(require 'font-lock)
 (require 'face-remap)
 (require 'image)
 (require 'json)
@@ -25,6 +27,9 @@
 (require 'tab-bar)
 (declare-function dired-preview-mode "dired-preview" (&optional arg))
 (declare-function wdired-get-filename "wdired" (&optional no-dir old))
+(defvar markdown-fontify-code-blocks-natively)
+(defvar compilation-error-regexp-alist)
+(defvar compilation-error-regexp-alist-alist)
 
 (defgroup neo-diredy nil "Three-column Dired view." :group 'dired)
 (defcustom neo-diredy-preview-bytes (* 64 1024)
@@ -90,20 +95,82 @@ Neo Git creates its layout asynchronously, so its entry command is too early.
 Advising its layout function does not load or require the optional package.")
 (defconst neo-diredy--variables
   '(header-line-format truncate-lines cursor-type
-		       display-line-numbers hl-line-face dired-hide-details-mode hl-line-mode))
+                       display-line-numbers hl-line-face hl-line-range-function
+                       dired-hide-details-mode hl-line-mode))
 
 (defun neo-diredy--icon (_file directory)
   "Return a simple label for a file of type DIRECTORY."
   (propertize (if directory "▸ " "· ")
               'face (if directory 'dired-directory 'shadow)))
 
+(defun neo-diredy--row-overlay ()
+  "Return the visible file anchor on the current line, if any."
+  (cl-find-if
+   (lambda (overlay)
+     (and (overlay-get overlay 'neo-diredy-file)
+          (not (invisible-p (overlay-start overlay)))))
+   (overlays-in (line-beginning-position)
+                (min (point-max) (1+ (line-end-position))))))
+
+(defun neo-diredy--normalize-point ()
+  "Keep selection on visible file rows, without restricting WDired edits."
+  (unless (or (derived-mode-p 'wdired-mode) (neo-diredy--row-overlay))
+    (let ((backward (and (overlayp neo-diredy--selected-icon)
+                         (eq (overlay-buffer neo-diredy--selected-icon) (current-buffer))
+                         (< (point) (overlay-start neo-diredy--selected-icon))))
+          before after)
+      (dolist (overlay neo-diredy--overlays)
+        (when (and (eq (overlay-buffer overlay) (current-buffer))
+                   (overlay-get overlay 'neo-diredy-file)
+                   (not (invisible-p (overlay-start overlay))))
+          (let ((position (overlay-start overlay)))
+            (if (< position (point))
+                (when (or (null before) (> position before)) (setq before position))
+              (when (or (null after) (< position after)) (setq after position))))))
+      (goto-char (or (if backward (or before after) (or after before)) (point-min))))))
+
+(defun neo-diredy--selection-range ()
+  "Highlight file rows only; an empty directory has no selection."
+  (when (or (derived-mode-p 'wdired-mode) (neo-diredy--row-overlay))
+    (cons (line-beginning-position) (line-beginning-position 2))))
+
+(defun neo-diredy--subdir-command (original &rest args)
+  "Operate on an inserted subdirectory from its visible directory row."
+  (if (not (and neo-diredy--layout-mode
+                (eq (selected-window) neo-diredy--center)
+                (derived-mode-p 'dired-mode)
+                (not (derived-mode-p 'wdired-mode))))
+      (apply original args)
+    (when-let* ((file (dired-get-filename nil t))
+                (entry (assoc (file-name-as-directory file) dired-subdir-alist)))
+      (goto-char (cdr entry)))
+    (let ((directory (dired-current-directory)))
+      (prog1 (apply original args)
+        ;; Headers are hidden in this view.  Keep the directory itself as
+        ;; the visible target for another toggle or removal of its listing.
+        (unless (equal directory default-directory)
+          ;; `dired-goto-file' can land on the subdirectory's hidden "."
+          ;; entry and unhide it.  Use our actual filename anchor instead.
+          (when-let* ((row (cl-find-if
+                           (lambda (overlay)
+                             (and (eq (overlay-buffer overlay) (current-buffer))
+                                  (equal (overlay-get overlay 'neo-diredy-file)
+                                         (directory-file-name directory))))
+                           neo-diredy--overlays)))
+            (goto-char (overlay-start row))))))))
+
+(defun neo-diredy--subdir-hidden-p (original directory)
+  "Read Dired's fold state beneath our hidden-header overlays."
+  (if (and neo-diredy--layout-mode (assq (current-buffer) neo-diredy--buffers))
+      (save-excursion
+        (dired-goto-subdir directory)
+        (eq (get-text-property (point) 'invisible) 'dired))
+    (funcall original directory)))
+
 (defun neo-diredy--highlight-icon ()
   "Match the current row's icon background without repainting the listing."
   ;; Overlay before-strings do not inherit the hl-line overlay's face.
-  (let ((selected (cl-find-if
-                   (lambda (overlay) (overlay-get overlay 'neo-diredy-file))
-                   (overlays-in (line-beginning-position)
-                                (min (point-max) (1+ (line-end-position)))))))
+  (let ((selected (neo-diredy--row-overlay)))
     (dolist (overlay (delete-dups (list neo-diredy--selected-icon selected)))
       (when (and (overlayp overlay) (overlay-buffer overlay))
         (let* ((text (copy-sequence (overlay-get overlay 'before-string)))
@@ -157,6 +224,7 @@ Advising its layout function does not load or require the optional package.")
               cursor-type (when (derived-mode-p 'wdired-mode) (or cursor-type t))
               display-line-numbers nil
               hl-line-face 'neo-diredy-selection
+              hl-line-range-function #'neo-diredy--selection-range
               header-line-format '(:eval (concat "  " (abbreviate-file-name default-directory))))
   (dired-hide-details-mode 1)
   (unless neo-diredy--modeline-face
@@ -170,10 +238,6 @@ Advising its layout function does not load or require the optional package.")
     (let ((width (if (>= (window-total-width neo-diredy--center) 32) 16 0)))
       (unless (= (or (cdr (window-margins neo-diredy--center)) 0) width)
         (set-window-margins neo-diredy--center (car neo-diredy--margins) width))))
-  (hl-line-mode 1)
-  (hl-line-highlight)
-  (when (overlayp hl-line-overlay)
-    (overlay-put hl-line-overlay 'face 'neo-diredy-selection))
   (when (and (or neo-diredy--listing-dirty
                  (not (eq (car neo-diredy--decorated) (current-buffer))))
              ;; Keep filename anchors while editing, including an empty name.
@@ -208,6 +272,11 @@ Advising its layout function does not load or require the optional package.")
 		(push overlay neo-diredy--overlays))))
 	  (forward-line 1))))
     (neo-diredy--metadata-paint))
+  (neo-diredy--normalize-point)
+  (hl-line-mode 1)
+  (hl-line-highlight)
+  (when (overlayp hl-line-overlay)
+    (overlay-put hl-line-overlay 'face 'neo-diredy-selection))
   (neo-diredy--highlight-icon)
   (neo-diredy--modeline-sync))
 
@@ -257,6 +326,12 @@ Advising its layout function does not load or require the optional package.")
            (entry (assq bar neo-diredy--windows)))
       (when (or (not entry) (eq (window-buffer bar) (cdr entry)))
         (unless (eq (window-buffer bar) buffer)
+          ;; Redisplay scrolls the one-pixel bar to its point.  When it is
+          ;; the last window to leave a buffer, Emacs remembers that start
+          ;; for the next visit.  Preserve the center's actual viewport.
+          (when-let* ((previous (assq (window-buffer bar)
+                                     (window-prev-buffers neo-diredy--center))))
+            (set-window-start bar (nth 1 previous) t))
           (set-window-dedicated-p bar nil)
           (set-window-buffer bar buffer)
           (set-window-dedicated-p bar t)
@@ -969,6 +1044,63 @@ Keep these volatile fields out of the file-content cache."
       (setq neo-diredy--preview-key key)
       (neo-diredy--insert-preview file attributes))))
 
+(defconst neo-diredy--preview-modes
+  '(("Emacs Lisp" emacs-lisp-mode lisp-mode)
+    ("Python" python-mode python)
+    ("C" c-mode cc-mode) ("C/C++ header" c-mode cc-mode)
+    ("C++" c++-mode cc-mode) ("C++ header" c++-mode cc-mode)
+    ("C#" csharp-mode csharp-mode) ("Java" java-mode cc-mode)
+    ("JavaScript" js-mode js) ("JavaScript/JSX" js-jsx-mode js)
+    ("JSON" js-json-mode js) ("HTML" html-mode sgml-mode)
+    ("XML" sgml-mode sgml-mode) ("SVG" sgml-mode sgml-mode)
+    ("CSS" css-mode css-mode)
+    ("Markdown" markdown-mode markdown-mode) ("Go" go-mode go-mode))
+  "Reviewed language modes and libraries used only for preview colors.
+Optional libraries are used only when already available on `load-path'.")
+
+(defun neo-diredy--fontify-preview (file)
+  "Copy syntax faces for FILE into the current bounded text preview.
+Do not visit FILE, use file-local settings, or run editing hooks.  Unknown
+languages, lines over 2000 characters and fontification errors stay plain."
+  (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
+         (mode (cdr (assoc (neo-diredy--details-language file text)
+                           neo-diredy--preview-modes)))
+         (short-lines (save-excursion
+                        (goto-char (point-min))
+                        (while (and (not (eobp))
+                                    (<= (- (line-end-position) (point)) 2000))
+                          (forward-line 1))
+                        (eobp))))
+    (when (and mode short-lines)
+      (let ((faces
+             (condition-case nil
+                 (when (require (cadr mode) nil t)
+                   (let ((enable-local-variables nil) (enable-local-eval nil)
+                         (change-major-mode-hook nil) (font-lock-mode-hook nil)
+                         (kill-buffer-hook nil) (kill-buffer-query-functions nil)
+                         (markdown-fontify-code-blocks-natively nil)
+                         (compilation-error-regexp-alist nil)
+                         (compilation-error-regexp-alist-alist nil))
+                     (with-temp-buffer
+                       (insert text)
+                       (delay-mode-hooks
+                         (funcall (car mode))
+                         (font-lock-ensure))
+                       ;; Only faces cross the boundary, never display properties,
+                       ;; keymaps, invisibility or text rewritten by a mode.
+                       (when (equal text (buffer-substring-no-properties (point-min) (point-max)))
+                         (let ((position (point-min)) spans)
+                           (while (< position (point-max))
+                             (let ((next (next-property-change position nil (point-max)))
+                                   (face (or (get-text-property position 'face)
+                                             (get-text-property position 'font-lock-face))))
+                               (when face (push (list position next face) spans))
+                               (setq position next)))
+                           spans)))))
+               (error nil))))
+        (dolist (span faces)
+          (put-text-property (car span) (cadr span) 'face (nth 2 span)))))))
+
 (defun neo-diredy--insert-preview (file attributes)
   "Render FILE without visiting it or evaluating file-local code."
   (with-current-buffer neo-diredy--preview
@@ -1030,6 +1162,7 @@ Keep these volatile fields out of the file-content cache."
                   (insert-file-contents file nil 0 (min size neo-diredy-preview-bytes)))
                 (if (save-excursion (goto-char (point-min)) (search-forward "\0" nil t))
                     (progn (erase-buffer) (insert (format "Binary file (%s)" (file-size-human-readable size))))
+                  (neo-diredy--fontify-preview file)
                   (when (> size neo-diredy-preview-bytes)
                     (goto-char (point-max)) (insert "\n… preview truncated"))))))))
         (error (setq neo-diredy--preview-key nil)
@@ -1135,6 +1268,9 @@ Keep these volatile fields out of the file-content cache."
   (advice-remove 'set-window-margins #'neo-diredy--protect-margins)
   (advice-remove 'mode-line-window-selected-p #'neo-diredy--modeline-active-p)
   (remove-hook 'pre-command-hook #'neo-diredy--modeline-select)
+  (dolist (command '(dired-hide-subdir dired-kill-subdir))
+    (advice-remove command #'neo-diredy--subdir-command))
+  (advice-remove 'dired-subdir-hidden-p #'neo-diredy--subdir-hidden-p)
   (remove-hook 'window-state-change-functions #'neo-diredy--modeline-resize)
   (remove-hook 'window-selection-change-functions #'neo-diredy--modeline-activity)
   (when (windowp neo-diredy--center)
@@ -1259,6 +1395,9 @@ All ordinary Dired operations remain available."
                           (window-list nil 'no-minibuffer)))
             (add-hook 'post-command-hook #'neo-diredy--post-command)
             (add-hook 'pre-command-hook #'neo-diredy--modeline-select)
+            (dolist (command '(dired-hide-subdir dired-kill-subdir))
+              (advice-add command :around #'neo-diredy--subdir-command))
+            (advice-add 'dired-subdir-hidden-p :around #'neo-diredy--subdir-hidden-p)
             (add-hook 'window-state-change-functions #'neo-diredy--modeline-resize 90)
             (add-hook 'window-selection-change-functions #'neo-diredy--modeline-activity)
             (advice-add 'set-window-margins :around #'neo-diredy--protect-margins)

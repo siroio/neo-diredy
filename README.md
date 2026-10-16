@@ -45,6 +45,8 @@ https://github.com/siroio/neo-diredy
 - 中央の一覧は標準Diredのバッファです。移動、マーク、コピー、リネーム、削除、再読込など、標準Diredの操作をそのまま使えます。Evilを使用している場合も、既存のDired用キー設定が使えます。
 - WDiredによるファイル名編集でも3カラムを維持します。Evil Collectionの `i` で入るINSERT状態や、InsertキーでのREPLACE切り替えにも対応します。編集時はカーソルを表示し、確定前のプレビューは元ファイルを参照します。確定は `C-c C-c`、取消は `C-c ESC` です。
 - 操作後もコンパクトな表示を維持します。権限・所有者などの詳細を表示して操作したい場合は、`neo-diredy-mode` をオフにしてください。
+- 通常の一覧ではファイル・ディレクトリ行だけを選択します。空ディレクトリには選択背景を表示しません。長い一覧からディレクトリを開いて戻った際も中央のスクロール位置を維持します。WDiredではファイル名の編集位置を制限しません。
+- Diredで挿入したサブディレクトリは、そのディレクトリ行から `dired-hide-subdir` で折り畳み・展開、`dired-kill-subdir` で一覧からの取り除きができます。
 - `M-x neo-diredy-mode` で通常のDired表示へ戻せます。同じコマンドで再び有効にできます。
 - ディレクトリ移動時は、次の画面描画までに表示を整えます。カーソル移動時のプレビューは0.12秒待ち、連続した移動による更新をまとめます。
 - ファイルを開くと補助欄を閉じます。タブを切り替える前にも閉じ、空の補助欄を保存タブに残しません。
@@ -78,7 +80,11 @@ https://github.com/siroio/neo-diredy
 
 ## プレビュー
 
-プレビューには専用バッファを使います。編集中のバッファを再利用せず、未保存の変更も破棄しません。ファイルのローカル変数や編集用フックも実行しません。テキストの構文ハイライトは行いません。
+プレビューには専用バッファを使います。編集中のバッファを再利用せず、未保存の変更も破棄しません。ファイルのローカル変数や編集用フックも実行しません。
+
+テキストは拡張子・shebangで言語を判定し、現在のテーマの構文色で表示します。Emacs Lisp、Python、C/C++、C#、Java、JavaScript/JSX、JSON、HTML/XML/SVG、CSSに対応します。`markdown-mode`・`go-mode` が `load-path` 上で利用できればMarkdown・Goも色付けします。追加パッケージやTree-sitter文法の自動インストールは行いません。
+
+色付けには隔離した一時バッファを使い、文字のfaceだけを本文へコピーします。ファイル内のモード指定、ユーザーの編集フック、Markdownコードブロック内の言語モードは実行しません。未対応の言語、色付けエラー、2000文字を超える行を含むプレビューは通常のテキスト表示になります。処理対象は本文の読込上限内に限ります。
 
 | 項目 | 既定値 |
 | --- | --- |
@@ -136,6 +142,8 @@ emacs -Q --batch -l tests/neo-diredy-metadata-tests.el -f ert-run-tests-batch-an
 emacs -Q --batch -l tests/neo-diredy-interop-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-details-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-modeline-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-syntax-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-navigation-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/check-package.el
 emacs -Q --batch -l benchmarks/run.el
 ```
