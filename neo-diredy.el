@@ -74,6 +74,7 @@
 (defvar neo-diredy--size-cache nil)
 (defvar neo-diredy--git-location nil)
 (defvar neo-diredy--git-state nil)
+(defvar neo-diredy--git-message nil)
 (defvar neo-diredy--margins nil)
 (defvar-local neo-diredy--file-sizes nil)
 (defvar-local neo-diredy--listing-dirty t)
@@ -136,9 +137,7 @@ Advising its layout function does not load or require the optional package.")
               hl-line-face 'neo-diredy-selection
               header-line-format '(:eval (concat "  " (abbreviate-file-name default-directory)))
               mode-line-format
-              (if (derived-mode-p 'wdired-mode)
-                  '("  WDIRED   " (:eval (neo-diredy--status)) "   C-c C-c: finish   C-c ESC: cancel")
-                '("  DIRED   " (:eval (neo-diredy--status)) "   M-x neo-diredy-mode: off")))
+              '((:eval (list (neo-diredy--status)))))
   (dired-hide-details-mode 1)
   (when (window-live-p neo-diredy--center)
     (let ((width (if (>= (window-total-width neo-diredy--center) 32) 16 0)))
@@ -184,20 +183,40 @@ Advising its layout function does not load or require the optional package.")
     (neo-diredy--metadata-paint)))
 
 (defun neo-diredy--status ()
-  "Return the current filename and marked entry count."
+  "Fit Git, size and marks to the center mode line without file I/O."
   (unless (eq neo-diredy--mark-tick (buffer-chars-modified-tick))
     (setq neo-diredy--mark-count 0
           neo-diredy--mark-tick (buffer-chars-modified-tick))
     (save-excursion
       (goto-char (point-min))
       (while (re-search-forward "^\\*" nil t) (cl-incf neo-diredy--mark-count))))
-  (let ((file (neo-diredy--original-file)))
-    (format "%s  %s  %s  |  %d marked%s"
-            (or (dired-get-filename 'no-dir t) "")
-            (neo-diredy--size-label file) (neo-diredy--git-label file)
-            neo-diredy--mark-count
-            (if (car neo-diredy--git-state)
-                (concat "  |  Git: " (car neo-diredy--git-state)) ""))))
+  (let* ((file (neo-diredy--original-file))
+         (width (max 1 (- (window-total-width neo-diredy--center) 2)))
+         (editing (derived-mode-p 'wdired-mode))
+         ;; Inheriting a bold face can change font metrics and break the
+         ;; continuous bottom edge.  Use only the theme's foreground colors.
+         (mode (propertize (if editing "WDired" "Dired") 'face
+                           `(:foreground ,(face-foreground 'font-lock-keyword-face nil t))))
+         (data (neo-diredy--git-display-data file))
+         (git (plist-get data :git))
+         (size (neo-diredy--size-label file))
+         (marks (when (> neo-diredy--mark-count 0) (format "%d marked" neo-diredy--mark-count))))
+    ;; Reserve actionable information before allowing a branch to grow.
+    (when (and marks (> (string-width (string-join (delq nil (list mode git size marks)) "  ")) width))
+      (setq marks (format "*%d" neo-diredy--mark-count)))
+    (let* ((fixed (string-join (delq nil (list mode size marks)) "  "))
+           (room (- width (string-width fixed) 2))
+           (label (when git (neo-diredy--details-git data (max (string-width git) room))))
+           (line (string-join
+                  (delq nil (list mode
+                                 label
+                                 size (when marks (propertize marks 'face
+                                                             `(:foreground ,(face-foreground 'font-lock-warning-face nil t)))))) "  ")))
+      (propertize (concat " " (truncate-string-to-width line width nil nil "…") " ")
+                  'help-echo
+                  (concat (when git (concat git " " (or (plist-get data :branch) "") "\n"))
+                          (if editing "C-c C-c: finish; C-c ESC: cancel"
+                            "M-x neo-diredy-mode: off"))))))
 
 ;;; Size and Git metadata (display strings never enter the Dired listing)
 
@@ -248,6 +267,15 @@ Advising its layout function does not load or require the optional package.")
   "Return non-nil for an unmerged porcelain state XY."
   (member xy '("DD" "AU" "UD" "UA" "DU" "AA" "UU")))
 
+(defun neo-diredy--git-display-data (file)
+  "Return cached Git display fields for FILE in the current directory."
+  (when (and neo-diredy-git-status (equal default-directory neo-diredy--git-location))
+    (if (car neo-diredy--git-state)
+        (let ((xy (neo-diredy--git-label file)))
+          (list :git (if (equal xy "  ") "Git" (format "Git [%s]" xy))
+                :branch (car neo-diredy--git-state)))
+      (when neo-diredy--git-message (list :git (concat "Git " neo-diredy--git-message))))))
+
 (defun neo-diredy--metadata-paint ()
   "Update only our display strings, preserving WDired edits and anchors."
   (dolist (overlay neo-diredy--overlays)
@@ -261,6 +289,7 @@ Advising its layout function does not load or require the optional package.")
           (overlay-put overlay 'before-string
                        (concat (propertize " " 'display `((margin right-margin) ,label))
                                (neo-diredy--icon file (overlay-get overlay 'neo-diredy-directory))))))))
+  (neo-diredy--details-paint)
   (force-mode-line-update))
 
 (defun neo-diredy--metadata-cancel (kind)
@@ -275,7 +304,8 @@ Advising its layout function does not load or require the optional package.")
 (defun neo-diredy--metadata-stop ()
   "Cancel jobs and invalidate metadata after rereading or closing a layout."
   (mapc #'neo-diredy--metadata-cancel '(size git))
-  (setq neo-diredy--size-cache nil neo-diredy--git-location nil neo-diredy--git-state nil))
+  (setq neo-diredy--size-cache nil neo-diredy--git-location nil
+        neo-diredy--git-state nil neo-diredy--git-message nil))
 
 (defun neo-diredy--metadata-start (kind key command callback)
   "Run COMMAND for KIND and KEY, passing bounded output or nil to CALLBACK."
@@ -377,16 +407,18 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
   "Start required background jobs for the current directory and selected FILE."
   (unless (equal default-directory neo-diredy--git-location)
     (neo-diredy--metadata-cancel 'git)
-    (setq neo-diredy--git-location default-directory neo-diredy--git-state nil)
-    (neo-diredy--metadata-paint)
+    (setq neo-diredy--git-location default-directory neo-diredy--git-state nil
+          neo-diredy--git-message (when neo-diredy-git-status "missing"))
     (when-let* ((git (and neo-diredy-git-status (executable-find "git"))))
+      (setq neo-diredy--git-message "loading")
       (let ((directory default-directory)
             (process-environment (copy-sequence process-environment)))
         (setenv "GIT_OPTIONAL_LOCKS" "0")
         (neo-diredy--metadata-start
          'git directory (list git "-C" directory "rev-parse" "--show-toplevel")
          (lambda (root)
-           (when root
+           (if (not root)
+               (progn (setq neo-diredy--git-message "unavailable") (neo-diredy--metadata-paint))
              (setq root (string-trim-right root "[\r\n]+"))
              (let ((process-environment (copy-sequence process-environment)))
                (setenv "GIT_OPTIONAL_LOCKS" "0")
@@ -394,8 +426,10 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
                 'git directory
                 (list git "-C" root "status" "--porcelain=v1" "-z" "--branch" "--untracked-files=normal")
                 (lambda (output)
+                  (setq neo-diredy--git-message (unless output "error"))
                   (when output (setq neo-diredy--git-state (neo-diredy--git-parse root output)))
-                  (neo-diredy--metadata-paint))))))))))
+                  (neo-diredy--metadata-paint)))))))))
+    (neo-diredy--metadata-paint))
   (let ((job (cdr (assq 'size neo-diredy--metadata-jobs))))
     (when (and job (not (equal file (process-get job 'key))))
       (neo-diredy--metadata-cancel 'size))
@@ -490,9 +524,9 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
     (with-current-buffer neo-diredy--preview
       (setq mode-line-format
             (unless (window-live-p neo-diredy--details-window)
-              '(:eval (list (or (car (neo-diredy--details-lines
-                                     neo-diredy--details-data
-                                     (max 1 (- (window-body-width) 2)))) " "))))))))
+              '(:eval (list (neo-diredy--details-compact
+                             (neo-diredy--details-display-data)
+                             (max 1 (- (window-body-width) 2))))))))))
 
 (defun neo-diredy--details-resize (frame)
   "Refit the preview and details after FRAME changes size."
@@ -519,8 +553,40 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
                      (> (length (car items)) width) (>= width 23))
             (setq items (list (substring (car items) 0 23))))
           (neo-diredy--details-fit items width))
-        (neo-diredy--details-fit (append (plist-get data :extra)
+        (neo-diredy--details-fit (append (list (neo-diredy--details-git data
+                                                  (if (plist-get data :extra) (max 12 (/ width 2)) width)))
+                                        (plist-get data :extra)
                                         (list (plist-get data :modified))) width)))
+
+(defun neo-diredy--details-display-data ()
+  "Combine file details with current Git and size caches, without I/O.
+Keep these volatile fields out of the file-content cache."
+  (let ((data (copy-sequence neo-diredy--details-data))
+        (file (car neo-diredy--details-key)))
+    (when (and file (window-live-p neo-diredy--center))
+      (with-current-buffer (window-buffer neo-diredy--center)
+        (when (and neo-diredy--file-sizes
+                   (eq (gethash file neo-diredy--file-sizes) 'directory)
+                   neo-diredy-directory-sizes)
+          (setq data (plist-put data :size (neo-diredy--size-label file))))
+        (when (string-prefix-p default-directory file (eq system-type 'windows-nt))
+          (setq data (append data (neo-diredy--git-display-data file))))))
+    data))
+
+(defun neo-diredy--details-git (data width)
+  "Fit Git state and branch from DATA to WIDTH, abbreviating the branch."
+  (when-let* ((git (plist-get data :git)))
+    (let* ((prefix (if (> (string-width git) width) "Git" git))
+           (branch (replace-regexp-in-string "[[:cntrl:]]" " " (or (plist-get data :branch) "")))
+           (room (- width (string-width prefix) 1)))
+      (if (and (> room 0) (not (string-empty-p branch)))
+          (concat prefix " " (truncate-string-to-width branch room nil nil "…"))
+        prefix))))
+
+(defun neo-diredy--details-compact (data width)
+  "Keep Git state visible in the one-line fallback, followed by file details."
+  (neo-diredy--details-fit (list (plist-get data :git) (plist-get data :size)
+                                (plist-get data :format) (plist-get data :branch)) width))
 
 (defun neo-diredy--details-paint ()
   "Paint cached details without any file I/O during redisplay."
@@ -531,7 +597,7 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
         (erase-buffer)
         (insert (string-join
                  (mapcar (lambda (line) (concat " " line))
-                         (neo-diredy--details-lines neo-diredy--details-data
+                         (neo-diredy--details-lines (neo-diredy--details-display-data)
                                                     (max 1 (- (window-body-width neo-diredy--right) 2))))
                  "\n"))
         (add-face-text-property (point-min) (point-max) 'shadow)

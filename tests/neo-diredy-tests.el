@@ -278,7 +278,7 @@
      (should (string-match-p "1 marked" (neo-diredy--status)))
      (dired-goto-file file)
      (dired-unmark 1)
-     (should (string-match-p "0 marked" (neo-diredy--status))))))
+     (should-not (string-match-p "marked" (neo-diredy--status))))))
 
 (ert-deftest neo-diredy-repeat-preview-does-not-read-again ()
   (neo-diredy-test--with-directory
