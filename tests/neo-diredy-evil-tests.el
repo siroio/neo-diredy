@@ -44,7 +44,7 @@
        (neo-diredy--post-command)
        (should (file-exists-p (expand-file-name "renamed-hello.txt" root)))
        (should neo-diredy--layout-mode)
-       (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
+       (should (= (+ 4 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
        (dolist (state '(evil-normal-state evil-visual-state evil-emacs-state evil-normal-state))
          (funcall state)
          (neo-diredy--post-command)

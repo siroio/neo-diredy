@@ -54,7 +54,7 @@
    (neo-diredy--post-command)
    (should (eq major-mode 'wdired-mode))
    (should neo-diredy--layout-mode)
-   (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
+   (should (= (+ 4 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
    (should dired-hide-details-mode)
    (should cursor-type)
    (insert "renamed-")
@@ -176,7 +176,7 @@
      (neo-diredy--post-command)
      (should neo-diredy--layout-mode)
      (should dired-hide-details-mode)
-     (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
+     (should (= (+ 4 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
      (should (cl-every (lambda (overlay) (eq (overlay-buffer overlay) (current-buffer)))
                        neo-diredy--overlays)))))
 
@@ -275,10 +275,10 @@
      (dired-mark 1)
      (neo-diredy--style)
      (should (equal overlays neo-diredy--overlays))
-     (should (string-match-p "1 marked" (neo-diredy--status)))
+     (should (equal (dired-get-marked-files) (list file)))
      (dired-goto-file file)
      (dired-unmark 1)
-     (should-not (string-match-p "marked" (neo-diredy--status))))))
+     (should-not (save-excursion (goto-char (point-min)) (re-search-forward "^\\*" nil t))))))
 
 (ert-deftest neo-diredy-repeat-preview-does-not-read-again ()
   (neo-diredy-test--with-directory
@@ -316,7 +316,7 @@
          (neo-diredy--layout-mode -1)
          (dired child)
          (should neo-diredy--layout-mode)
-         (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
+         (should (= (+ 4 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
          (neo-diredy-mode -1)
          (dired root)
          (should-not neo-diredy--layout-mode)
@@ -329,7 +329,7 @@
          (details dired-hide-details-mode)
          (header header-line-format))
      (neo-diredy--layout-mode 1)
-     (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
+     (should (= (+ 4 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
      (should (eq source (window-buffer neo-diredy--center)))
      (should dired-hide-details-mode)
      (dired-goto-file file)
@@ -352,7 +352,7 @@
    (neo-diredy--refresh)
    (should (equal (file-name-as-directory child) default-directory))
    (should dired-hide-details-mode)
-   (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
+   (should (= (+ 4 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))
    (dired-up-directory)
    (neo-diredy--refresh)
    (should (equal (file-name-as-directory root) default-directory))))
@@ -419,7 +419,7 @@
   (neo-diredy-test--with-directory
    (neo-diredy--layout-mode 1)
    (neo-diredy--layout-mode 1)
-   (should (= (+ 3 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))))
+   (should (= (+ 4 (if (window-live-p neo-diredy--details-window) 1 0)) (length (window-list))))))
 
 (ert-deftest neo-diredy-test-directory-style-is-synchronous ()
   (neo-diredy-test--with-directory

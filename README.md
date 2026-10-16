@@ -43,7 +43,7 @@ https://github.com/siroio/neo-diredy
 ## 操作と表示
 
 - 中央の一覧は標準Diredのバッファです。移動、マーク、コピー、リネーム、削除、再読込など、標準Diredの操作をそのまま使えます。Evilを使用している場合も、既存のDired用キー設定が使えます。
-- WDiredによるファイル名編集でも3カラムを維持します。Evil Collectionの `i` で入るINSERT状態や、InsertキーでのREPLACE切り替えにも対応します。編集時はカーソルと `WDired` 表示を出し、確定前のプレビューは元ファイルを参照します。確定は `C-c C-c`、取消は `C-c ESC` です。modelineのツールチップでも確認できます。
+- WDiredによるファイル名編集でも3カラムを維持します。Evil Collectionの `i` で入るINSERT状態や、InsertキーでのREPLACE切り替えにも対応します。編集時はカーソルを表示し、確定前のプレビューは元ファイルを参照します。確定は `C-c C-c`、取消は `C-c ESC` です。
 - 操作後もコンパクトな表示を維持します。権限・所有者などの詳細を表示して操作したい場合は、`neo-diredy-mode` をオフにしてください。
 - `M-x neo-diredy-mode` で通常のDired表示へ戻せます。同じコマンドで再び有効にできます。
 - ディレクトリ移動時は、次の画面描画までに表示を整えます。カーソル移動時のプレビューは0.12秒待ち、連続した移動による更新をまとめます。
@@ -52,14 +52,13 @@ https://github.com/siroio/neo-diredy
 - ヘルプなどを開いてDiredが選択されたままの場合は、3カラム表示の自動再作成を保留します。ヘルプを閉じる、別画面からDiredに戻る、元の画面構成に戻す、Diredでカーソルを移動する、Diredを開き直す、といった操作で再開します。M-xを開いて取り消すだけでは再作成しません。
 - 一度に表示できる3カラムのレイアウトは1つです。幅72桁未満のウィンドウとリモートディレクトリでは通常のDiredを使います。
 - 配色は現在のテーマを継承します。選択行は `neo-diredy-selection` faceで調整できます。
+- modelineは設定済みの `mode-line-format` を変更せず、3ペイン全体の下部左端から表示します。行・桁、メジャーモード、文字コード、画像など、通常の表示をそのまま使います。modelineは同じDiredバッファを表示する専用ウィンドウに置き、中央のカーソル位置と同期します。`%p` などウィンドウの表示範囲に依存する項目は、下部ウィンドウを基準に計算されます。
 
 ## サイズとGit状態
 
-中央の一覧の右端に容量と2文字のGit状態を表示します。下部には選択項目の容量・状態、マーク数、Gitのブランチ情報を表示します。中央ペインの幅が32桁未満の場合は右端の欄を省略しますが、下部で確認できます。ファイル名は通常のDiredのままで、長い名前やWDiredの編集欄に表示用の文字を混ぜません。
+中央の各行の右端に容量と2文字のGit状態を表示します。本文の中央寄せなど、他の設定が余白を調整しても、neo-diredyの中央一覧では右端の状態欄を確保します。中央ペインの幅が32桁未満の場合は右端の欄を省略しますが、選択項目の容量・Git情報は右ペインの詳細欄で確認できます。ファイル名は通常のDiredのままで、長い名前やWDiredの編集欄に表示用の文字を混ぜません。
 
-modelineは `Dired  Git [ M] main  3.2 KiB  2 marked` のように表示します。ファイル名と常時表示の操作案内を省き、長いブランチ名は残り幅に合わせて短縮します。マークがないときはマーク数を省略し、狭い場合は `*2` のように表示します。完全なブランチ情報と操作案内はツールチップで確認できます。
-
-Git取得中は `Git loading`、Git実行ファイルが見つからない場合は `Git missing`、ルートを取得できない場合は `Git unavailable`、状態取得の失敗・タイムアウトは `Git error` と表示します。`unavailable` はGit管理外のフォルダーでも表示されます。`g` で再取得できます。
+右ペインの詳細欄では、Git取得中は `Git loading`、Git実行ファイルが見つからない場合は `Git missing`、ルートを取得できない場合は `Git unavailable`、状態取得の失敗・タイムアウトは `Git error` と表示します。`unavailable` はGit管理外のフォルダーでも表示されます。`g` で再取得できます。
 
 ```text
 ▸ src                 12.4 MiB  M
@@ -91,7 +90,7 @@ Git取得中は `Git loading`、Git実行ファイルが見つからない場合
 
 ### 下部の詳細情報
 
-右ペインの下部に、プレビューとは独立した最大3行の情報欄を表示します。画像や本文には重ねません。情報欄はmode-lineを含めて右ペインの高さの1/4以内に抑え、本文を最低6行確保できない画面ではmode-lineの1行表示へ縮めます。画面サイズ変更にも追従し、最下端のmode-lineは左・中央と揃えます。
+右ペインの下部に、プレビューとは独立した最大3行の情報欄を表示します。画像や本文には重ねません。情報欄は右ペインの高さの1/4以内に抑え、本文を最低6行確保できない画面ではプレビュー見出し横の1行表示へ縮めます。画面サイズ変更にも追従します。補助欄に独自のmodelineや通常のバッファ用ヘッダーは表示しません。
 
 | 種類 | 主な情報 |
 | --- | --- |
@@ -136,6 +135,7 @@ emacs -Q --batch -l tests/neo-diredy-art-tests.el -f ert-run-tests-batch-and-exi
 emacs -Q --batch -l tests/neo-diredy-metadata-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-interop-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-details-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-modeline-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/check-package.el
 emacs -Q --batch -l benchmarks/run.el
 ```

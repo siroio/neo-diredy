@@ -47,6 +47,8 @@
 (defvar neo-diredy--center nil)
 (defvar neo-diredy--left nil)
 (defvar neo-diredy--right nil)
+(defvar neo-diredy--modeline-window nil)
+(defvar neo-diredy--modeline-parameter nil)
 (defvar neo-diredy--parent nil)
 (defvar neo-diredy--preview nil)
 (defvar neo-diredy--configuration nil)
@@ -77,9 +79,8 @@
 (defvar neo-diredy--git-message nil)
 (defvar neo-diredy--margins nil)
 (defvar-local neo-diredy--file-sizes nil)
+(defvar-local neo-diredy--modeline-face nil)
 (defvar-local neo-diredy--listing-dirty t)
-(defvar-local neo-diredy--mark-tick nil)
-(defvar-local neo-diredy--mark-count 0)
 (defvar w32-get-true-file-attributes)
 (defconst neo-diredy--layout-commands
   '(tab-bar-new-tab tab-bar-select-tab tab-bar-close-tab neo-git--layout)
@@ -87,7 +88,7 @@
 Neo Git creates its layout asynchronously, so its entry command is too early.
 Advising its layout function does not load or require the optional package.")
 (defconst neo-diredy--variables
-  '(header-line-format mode-line-format truncate-lines cursor-type
+  '(header-line-format truncate-lines cursor-type
 		       display-line-numbers hl-line-face dired-hide-details-mode hl-line-mode))
 
 (defun neo-diredy--icon (_file directory)
@@ -135,11 +136,16 @@ Advising its layout function does not load or require the optional package.")
               cursor-type (when (derived-mode-p 'wdired-mode) (or cursor-type t))
               display-line-numbers nil
               hl-line-face 'neo-diredy-selection
-              header-line-format '(:eval (concat "  " (abbreviate-file-name default-directory)))
-              mode-line-format
-              '((:eval (list (neo-diredy--status)))))
+              header-line-format '(:eval (concat "  " (abbreviate-file-name default-directory))))
   (dired-hide-details-mode 1)
+  (unless neo-diredy--modeline-face
+    (setq neo-diredy--modeline-face
+          (face-remap-add-relative
+           'mode-line-inactive
+           `(:filtered (:window neo-diredy-modeline t)
+                       ,(if (facep 'mode-line-active) 'mode-line-active 'mode-line)))))
   (when (window-live-p neo-diredy--center)
+    (set-window-parameter neo-diredy--center 'mode-line-format 'none)
     (let ((width (if (>= (window-total-width neo-diredy--center) 32) 16 0)))
       (unless (= (or (cdr (window-margins neo-diredy--center)) 0) width)
         (set-window-margins neo-diredy--center (car neo-diredy--margins) width))))
@@ -180,43 +186,70 @@ Advising its layout function does not load or require the optional package.")
 		(overlay-put overlay 'invisible t)
 		(push overlay neo-diredy--overlays))))
 	  (forward-line 1))))
-    (neo-diredy--metadata-paint)))
+    (neo-diredy--metadata-paint))
+  (neo-diredy--modeline-sync))
 
-(defun neo-diredy--status ()
-  "Fit Git, size and marks to the center mode line without file I/O."
-  (unless (eq neo-diredy--mark-tick (buffer-chars-modified-tick))
-    (setq neo-diredy--mark-count 0
-          neo-diredy--mark-tick (buffer-chars-modified-tick))
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward "^\\*" nil t) (cl-incf neo-diredy--mark-count))))
-  (let* ((file (neo-diredy--original-file))
-         (width (max 1 (- (window-total-width neo-diredy--center) 2)))
-         (editing (derived-mode-p 'wdired-mode))
-         ;; Inheriting a bold face can change font metrics and break the
-         ;; continuous bottom edge.  Use only the theme's foreground colors.
-         (mode (propertize (if editing "WDired" "Dired") 'face
-                           `(:foreground ,(face-foreground 'font-lock-keyword-face nil t))))
-         (data (neo-diredy--git-display-data file))
-         (git (plist-get data :git))
-         (size (neo-diredy--size-label file))
-         (marks (when (> neo-diredy--mark-count 0) (format "%d marked" neo-diredy--mark-count))))
-    ;; Reserve actionable information before allowing a branch to grow.
-    (when (and marks (> (string-width (string-join (delq nil (list mode git size marks)) "  ")) width))
-      (setq marks (format "*%d" neo-diredy--mark-count)))
-    (let* ((fixed (string-join (delq nil (list mode size marks)) "  "))
-           (room (- width (string-width fixed) 2))
-           (label (when git (neo-diredy--details-git data (max (string-width git) room))))
-           (line (string-join
-                  (delq nil (list mode
-                                 label
-                                 size (when marks (propertize marks 'face
-                                                             `(:foreground ,(face-foreground 'font-lock-warning-face nil t)))))) "  ")))
-      (propertize (concat " " (truncate-string-to-width line width nil nil "…") " ")
-                  'help-echo
-                  (concat (when git (concat git " " (or (plist-get data :branch) "") "\n"))
-                          (if editing "C-c C-c: finish; C-c ESC: cancel"
-                            "M-x neo-diredy-mode: off"))))))
+(defun neo-diredy--protect-margins (original window left &optional right)
+  "Keep the owned row metadata column when other layout code sets margins."
+  (when (and neo-diredy--layout-mode
+             (eq (or window (selected-window)) neo-diredy--center)
+             (assq (window-buffer neo-diredy--center) neo-diredy--buffers))
+    (setq right (if (>= (window-total-width neo-diredy--center) 32) 16 0)))
+  (funcall original window left right))
+
+(defun neo-diredy--modeline-select ()
+  "Return keyboard commands to the list after a mode-line mouse action."
+  (when (and (window-live-p neo-diredy--center)
+             (window-live-p neo-diredy--modeline-window)
+             (assq (window-buffer neo-diredy--center) neo-diredy--buffers)
+             (eq (window-buffer neo-diredy--modeline-window)
+                 (cdr (assq neo-diredy--modeline-window neo-diredy--windows)))
+             (eq (selected-window) neo-diredy--modeline-window))
+    (select-window neo-diredy--center)))
+
+(defun neo-diredy--modeline-resize (frame)
+  "Refit the native bar after fonts or window dimensions change on FRAME."
+  (when (and neo-diredy--layout-mode (neo-diredy--layout-intact-p)
+             (eq frame (window-frame neo-diredy--center)))
+    (neo-diredy--modeline-sync)))
+
+(defun neo-diredy--modeline-activity (&rest _)
+  "Use the active face only while the central list has the selection."
+  (when (window-live-p neo-diredy--modeline-window)
+    (set-window-parameter neo-diredy--modeline-window 'neo-diredy-modeline
+                          (eq (selected-window) neo-diredy--center))))
+
+(defun neo-diredy--modeline-active-p (original)
+  "Treat the owned bar as active while its Dired list is selected."
+  (or (funcall original)
+      (and neo-diredy--layout-mode
+           (eq (selected-window) neo-diredy--modeline-window)
+           (eq (old-selected-window) neo-diredy--center))))
+
+(defun neo-diredy--modeline-sync ()
+  "Show the center's native mode line across the original window's width."
+  (when (and (window-live-p neo-diredy--modeline-window)
+             (window-live-p neo-diredy--center))
+    (let* ((bar neo-diredy--modeline-window)
+           (buffer (window-buffer neo-diredy--center))
+           (entry (assq bar neo-diredy--windows)))
+      (when (or (not entry) (eq (window-buffer bar) (cdr entry)))
+        (unless (eq (window-buffer bar) buffer)
+          (set-window-dedicated-p bar nil)
+          (set-window-buffer bar buffer)
+          (set-window-dedicated-p bar t)
+          (when entry (setcdr entry buffer)))
+        (set-window-point bar (window-point neo-diredy--center))
+        (set-window-start bar (window-start neo-diredy--center) t)
+        (let* ((height (window-mode-line-height bar))
+               ;; Emacs hides a mode line if no text pixel remains.  One
+               ;; pixel keeps native rendering, images, alignment and maps.
+               (pixels (if (display-graphic-p (window-frame bar)) (1+ height)
+                         (* 2 (frame-char-height (window-frame bar)))))
+               (window-resize-pixelwise t))
+          (when (and (> height 0) (/= pixels (window-pixel-height bar)))
+            (ignore-errors
+              (window-resize bar (- pixels (window-pixel-height bar)) nil 'safe t))))))))
 
 ;;; Size and Git metadata (display strings never enter the Dired listing)
 
@@ -495,9 +528,7 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
          (column-pixels (+ (window-pixel-height neo-diredy--right)
                            (if (window-live-p footer) (window-pixel-height footer) 0)))
          (line-pixels (frame-char-height (window-frame neo-diredy--right)))
-         (pixels (+ (* 3 line-pixels)
-                    (max line-pixels (window-mode-line-height
-                                      (if (window-live-p footer) footer neo-diredy--right)))))
+         (pixels (* 3 line-pixels))
          (window-resize-pixelwise t)
          (window-min-height 2))
     (when (and (>= height 16) (<= (* 4 pixels) column-pixels) (not (window-live-p footer)))
@@ -510,8 +541,7 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
         (push (cons footer neo-diredy--details-buffer) neo-diredy--windows)))
     (when (window-live-p footer)
       (with-current-buffer neo-diredy--preview (setq mode-line-format nil))
-      ;; Themes can make the mode-line taller than a text line.  Reserve its
-      ;; actual pixels as well, otherwise the third detail line gets clipped.
+      ;; The only mode line belongs to the full-width bottom window.
       (unless (= pixels (window-pixel-height footer))
         (ignore-errors (window-resize footer (- pixels (window-pixel-height footer)) nil nil t)))
       (when (or (< height 16)
@@ -520,13 +550,19 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
                    (+ (window-pixel-height footer) (window-pixel-height neo-diredy--right))))
         (setq neo-diredy--windows (assq-delete-all footer neo-diredy--windows))
         (delete-window footer)
-        (setq neo-diredy--details-window nil)))
-    (with-current-buffer neo-diredy--preview
-      (setq mode-line-format
-            (unless (window-live-p neo-diredy--details-window)
-              '(:eval (list (neo-diredy--details-compact
-                             (neo-diredy--details-display-data)
-                             (max 1 (- (window-body-width) 2))))))))))
+        (setq neo-diredy--details-window nil)))))
+
+(defun neo-diredy--preview-header ()
+  "Keep compact details beside the preview title when the footer cannot fit."
+  (let* ((width (max 1 (- (window-body-width neo-diredy--right) 2)))
+         (title (if (car neo-diredy--details-key)
+                    (file-name-nondirectory (car neo-diredy--details-key)) "Preview"))
+         (details (unless (window-live-p neo-diredy--details-window)
+                    (neo-diredy--details-compact (neo-diredy--details-display-data)
+                                                (max 1 (/ width 2)))))
+         (suffix (if (or (not details) (string-empty-p details)) "" (concat " | " details))))
+    (concat "  " (truncate-string-to-width title (max 0 (- width (string-width suffix))) nil nil "…")
+            suffix)))
 
 (defun neo-diredy--details-resize (frame)
   "Refit the preview and details after FRAME changes size."
@@ -911,7 +947,7 @@ Keep these volatile fields out of the file-content cache."
   (with-current-buffer neo-diredy--preview
     (let ((inhibit-read-only t))
       (erase-buffer)
-      (setq header-line-format (concat "  " (if file (file-name-nondirectory file) "Preview")))
+      (setq header-line-format '(:eval (list (neo-diredy--preview-header))))
       (condition-case error-data
           (cond
            ((null file) (insert "No file selected"))
@@ -1017,6 +1053,8 @@ Keep these volatile fields out of the file-content cache."
 (defun neo-diredy--post-command ()
   "Follow ordinary Dired navigation, debouncing cursor preview updates."
   (when neo-diredy--layout-mode
+    (neo-diredy--modeline-select)
+    (neo-diredy--modeline-activity)
     (cond
      ((not (neo-diredy--layout-intact-p))
       ;; Foreign windows and buffers are authoritative, including popups that
@@ -1067,6 +1105,15 @@ Keep these volatile fields out of the file-content cache."
   (neo-diredy--art-stop)
   (neo-diredy--details-stop)
   (neo-diredy--metadata-stop)
+  (advice-remove 'set-window-margins #'neo-diredy--protect-margins)
+  (advice-remove 'mode-line-window-selected-p #'neo-diredy--modeline-active-p)
+  (remove-hook 'pre-command-hook #'neo-diredy--modeline-select)
+  (remove-hook 'window-state-change-functions #'neo-diredy--modeline-resize)
+  (remove-hook 'window-selection-change-functions #'neo-diredy--modeline-activity)
+  (when (windowp neo-diredy--center)
+    ;; Deleted windows can be resurrected by a saved configuration.  Clear
+    ;; our parameter on that object too, before a later restore revives it.
+    (set-window-parameter neo-diredy--center 'mode-line-format neo-diredy--modeline-parameter))
   (when (and (window-live-p neo-diredy--center)
              (assq (window-buffer neo-diredy--center) neo-diredy--buffers))
     (set-window-margins neo-diredy--center (car neo-diredy--margins) (cdr neo-diredy--margins)))
@@ -1082,6 +1129,9 @@ Keep these volatile fields out of the file-content cache."
         (remove-hook 'after-change-functions #'neo-diredy--changed t)
         (remove-hook 'dired-after-readin-hook #'neo-diredy--after-readin t)
         (kill-local-variable 'neo-diredy--file-sizes)
+        (when neo-diredy--modeline-face
+          (face-remap-remove-relative neo-diredy--modeline-face)
+          (kill-local-variable 'neo-diredy--modeline-face))
         (hl-line-mode (if (caddr (assq 'hl-line-mode (cadr entry))) 1 -1))
         (dired-hide-details-mode (if (caddr (assq 'dired-hide-details-mode (cadr entry))) 1 -1))
         (dolist (saved (cadr entry))
@@ -1096,17 +1146,23 @@ Keep these volatile fields out of the file-content cache."
            (position (and buffer (window-point window))))
       (with-selected-frame (window-configuration-frame neo-diredy--configuration)
         (set-window-configuration neo-diredy--configuration)
+        (set-window-parameter (selected-window) 'mode-line-format neo-diredy--modeline-parameter)
         (when (buffer-live-p buffer)
           (set-window-buffer (selected-window) buffer t)
           (set-window-point (selected-window) position)))))
   ;; A plugin may reuse an auxiliary window after removing its dedication.
   ;; Release our navigation flag, but never delete a window it has taken over.
-  (dolist (entry (list (cons neo-diredy--details-window neo-diredy--details-buffer)
+  (dolist (entry (list (assq neo-diredy--modeline-window neo-diredy--windows)
+                       (cons neo-diredy--details-window neo-diredy--details-buffer)
                        (cons neo-diredy--left neo-diredy--parent)
                        (cons neo-diredy--right neo-diredy--preview)))
     (let ((window (car entry)) (buffer (cdr entry)))
       (when (window-live-p window)
         (set-window-parameter window 'no-other-window nil)
+        (when (eq window neo-diredy--modeline-window)
+          (set-window-parameter window 'neo-diredy-modeline nil)
+          (when (eq (window-parameter window 'header-line-format) 'none)
+            (set-window-parameter window 'header-line-format nil)))
         (when (eq (window-buffer window) buffer)
           (set-window-dedicated-p window nil)
           (unless (one-window-p t (window-frame window))
@@ -1120,6 +1176,7 @@ Keep these volatile fields out of the file-content cache."
         neo-diredy--windows nil neo-diredy--center nil
         neo-diredy--left nil neo-diredy--right nil neo-diredy--margins nil
         neo-diredy--details-window nil neo-diredy--details-buffer nil
+        neo-diredy--modeline-window nil neo-diredy--modeline-parameter nil
         neo-diredy--configuration nil neo-diredy--key nil
         neo-diredy--directory nil neo-diredy--timer nil
         neo-diredy--decorated nil neo-diredy--preview-key nil)
@@ -1146,18 +1203,21 @@ All ordinary Dired operations remain available."
             (setq neo-diredy--handoff nil
                   neo-diredy--configuration (current-window-configuration)
                   neo-diredy--center (selected-window)
+                  neo-diredy--modeline-parameter (window-parameter nil 'mode-line-format)
                   neo-diredy--margins (window-margins))
+            (setq neo-diredy--modeline-window (split-window neo-diredy--center -2 'below))
+            (set-window-buffer neo-diredy--modeline-window (current-buffer))
+            (set-window-parameter neo-diredy--modeline-window 'header-line-format 'none)
+            (set-window-parameter neo-diredy--modeline-window 'mode-line-format nil)
+            (set-window-parameter neo-diredy--modeline-window 'no-other-window t)
+            (set-window-parameter neo-diredy--modeline-window 'neo-diredy-modeline t)
+            (set-window-dedicated-p neo-diredy--modeline-window t)
             (dolist (symbol '(neo-diredy--parent neo-diredy--preview neo-diredy--details-buffer))
               (set symbol (generate-new-buffer (format " *%s*" symbol)))
               (with-current-buffer (symbol-value symbol)
                 (special-mode)
-                (setq-local truncate-lines t cursor-type nil mode-line-format '(" ")
-                            display-line-numbers nil)
-                ;; Keep the bottom edge continuous with the active Dired pane.
-                ;; These remappings live only in our disposable auxiliary buffers.
-                (face-remap-add-relative
-                 'mode-line-inactive
-                 (if (facep 'mode-line-active) 'mode-line-active 'mode-line))))
+                (setq-local truncate-lines t cursor-type nil mode-line-format nil header-line-format nil
+                            display-line-numbers nil)))
             (let ((width (window-total-width)))
               (setq neo-diredy--left (split-window neo-diredy--center (- (max 16 (/ width 5))) 'left)
                     neo-diredy--right (split-window neo-diredy--center nil 'right)))
@@ -1170,6 +1230,11 @@ All ordinary Dired operations remain available."
                   (mapcar (lambda (window) (cons window (window-buffer window)))
                           (window-list nil 'no-minibuffer)))
             (add-hook 'post-command-hook #'neo-diredy--post-command)
+            (add-hook 'pre-command-hook #'neo-diredy--modeline-select)
+            (add-hook 'window-state-change-functions #'neo-diredy--modeline-resize 90)
+            (add-hook 'window-selection-change-functions #'neo-diredy--modeline-activity)
+            (advice-add 'set-window-margins :around #'neo-diredy--protect-margins)
+            (advice-add 'mode-line-window-selected-p :around #'neo-diredy--modeline-active-p)
             (add-hook 'window-size-change-functions #'neo-diredy--details-resize)
             (dolist (command neo-diredy--layout-commands)
               (advice-add command :before #'neo-diredy--before-layout-change))
