@@ -4,6 +4,115 @@
 
 (defvar neo-diredy-test--local-code nil)
 (defvar markdown-fontify-code-blocks-natively)
+(defvar diff-font-lock-syntax)
+(defvar diff-font-lock-prettify)
+(defvar diff-refine)
+
+(defun neo-diredy-test--assert-preview-face (root name text token)
+  "Assert that NAME previews TEXT faithfully with a face on TOKEN."
+  (let ((source (expand-file-name name root)))
+    (with-temp-file source (insert text))
+    (neo-diredy--render-preview source)
+    (with-current-buffer neo-diredy--preview
+      (should (equal (buffer-substring-no-properties (point-min) (point-max)) text))
+      (goto-char (point-min))
+      (search-forward token)
+      (should (get-text-property (1- (point)) 'face)))))
+
+(ert-deftest neo-diredy-syntax-additional-conventional-languages ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (dolist (sample '(("sample.rb" ruby-mode "def hello\n  return 1\nend\n" "return")
+                     ("sample.sh" sh-script "#!/bin/sh\nif true; then echo hello; fi\n" "if")
+                     ("sample.sql" sql "SELECT value FROM example;\n" "SELECT")
+                     ("sample.tex" tex-mode "\\section{Hello}\n" "section")
+                     ("sample.lua" lua-mode "local function hello() return 1 end\n" "return")
+                     ("Makefile" make-mode "all: main.o\n\techo hello\n" "all")
+                     ("sample.ini" conf-mode "; comment\n[section]\nkey=value\n" "comment")
+                     ("sample.bat" bat-mode "@echo off\nREM comment\n" "comment")
+                     ("sample.pl" perl-mode "my $value = 1; # comment\n" "comment")
+                     ("sample.org" org "* Heading\n" "Heading")))
+     (when (locate-library (symbol-name (nth 1 sample)))
+       (ert-info ((car sample))
+         (neo-diredy-test--assert-preview-face root (car sample) (nth 2 sample) (nth 3 sample)))))))
+
+(ert-deftest neo-diredy-syntax-extension-aliases ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (dolist (extension '("cc" "cxx" "hh" "hxx"))
+     (ert-info (extension)
+       (neo-diredy-test--assert-preview-face root (concat "sample." extension)
+                                            "class Example { public: int value; };\n" "public")))
+   (dolist (extension '("mjs" "cjs"))
+     (ert-info (extension)
+       (neo-diredy-test--assert-preview-face root (concat "sample." extension)
+                                            "function hello() { return 1; }\n" "return")))
+   (dolist (extension '("pyw" "pyi"))
+     (ert-info (extension)
+       (neo-diredy-test--assert-preview-face root (concat "sample." extension)
+                                            "def hello():\n    return 1\n" "return")))
+   (neo-diredy-test--assert-preview-face root "sample.htm" "<html>hello</html>\n" "html")
+   (when (locate-library "markdown-mode")
+     (neo-diredy-test--assert-preview-face root "sample.markdown" "# Heading\n" "Heading"))))
+
+(ert-deftest neo-diredy-syntax-special-file-names ()
+  (dolist (sample '(("Makefile" . "Makefile") ("GNUmakefile" . "Makefile")
+                    (".bashrc" . "Shell") (".zshrc" . "Shell") (".profile" . "Shell")
+                    ("Gemfile" . "Ruby") ("Rakefile" . "Ruby")
+                    (".gitignore" . "Git ignore")))
+    (ert-info ((car sample))
+      (should (equal (neo-diredy--details-language (car sample) "") (cdr sample))))))
+
+(ert-deftest neo-diredy-syntax-additional-mode-hook-isolation ()
+  ;; Preload library load hooks separately; this checks mode/font-lock activity.
+  (dolist (library '(ruby-mode sh-script tex-mode make-mode org)) (require library))
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (let ((hooks-ran nil))
+     (cl-progv '(ruby-mode-hook sh-mode-hook sh-set-shell-hook tex-mode-hook
+                 latex-mode-hook latex-math-mode-hook makefile-mode-hook
+                 makefile-gmake-mode-hook org-mode-hook org-font-lock-hook
+                 org-font-lock-set-keywords-hook org-cycle-hook)
+         (make-list 12 (list (lambda (&rest _) (setq hooks-ran t))))
+       (dolist (sample '(("hook.rb" "def hello; return 1; end\n" "return")
+                         ("hook.sh" "#!/bin/sh\nif true; then echo hello; fi\n" "if")
+                         ("hook.tex" "\\section{Hello}\n" "section")
+                         ("Makefile" "all: main.o\n\techo hello\n" "all")
+                         ("hook.org" "* Heading\n" "Heading")))
+         (ert-info ((car sample))
+           (neo-diredy-test--assert-preview-face root (car sample) (nth 1 sample) (nth 2 sample))
+           (should-not hooks-ran)))))))
+
+(ert-deftest neo-diredy-syntax-diff-and-patch ()
+  (require 'diff-mode)
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (let ((text "diff --git a/code.py b/code.py\n--- a/code.py\n+++ b/code.py\n@@ -1 +1 @@\n-old\n+new\n")
+         (diff-font-lock-syntax 'hunk-also)
+         (diff-font-lock-prettify t)
+         (diff-refine 'font-lock)
+         (side-effect nil))
+     (cl-progv '(diff-mode-hook hack-local-variables-hook before-hack-local-variables-hook)
+         (make-list 3 (list (lambda () (setq side-effect t))))
+       (cl-letf (((symbol-function 'diff-find-file-name)
+                  (lambda (&rest _) (setq side-effect t) nil))
+                 ((symbol-function 'call-process)
+                  (lambda (&rest _) (setq side-effect t) 0)))
+         (dolist (extension '("diff" "patch" "DIFF" "rej"))
+           (let ((source (expand-file-name (concat "sample." extension) root)))
+             (with-temp-file source (insert text))
+             (neo-diredy--render-preview source)
+             (should (equal (plist-get neo-diredy--details-data :format) "Diff"))
+             (with-current-buffer neo-diredy--preview
+               (should (equal (buffer-string) text))
+               (dolist (sample '(("@@ -1 +1 @@" . diff-hunk-header)
+                                 ("-old" . diff-removed) ("+new" . diff-added)))
+                 (goto-char (point-min))
+                 (search-forward (car sample))
+                 (let ((face (get-text-property (1- (point)) 'face)))
+                   (should (or (eq face (cdr sample))
+                               (and (listp face) (memq (cdr sample) face)))))))))))
+     (should-not side-effect))))
 
 ;; Optional installed packages are read only; never install or load user init.
 (let ((directory (or (getenv "NEO_DIREDY_TEST_ELPA")
@@ -96,7 +205,9 @@
 (ert-deftest neo-diredy-syntax-bounded-and-failure-fallback ()
   (neo-diredy-test--with-directory
    (neo-diredy--layout-mode 1)
-   (let ((source (expand-file-name "sample.py" root)))
+   ;; Conventional fontification keeps its long-line guard.
+   (let ((source (expand-file-name "sample.py" root))
+         (neo-diredy--preview-treesit-modes nil))
      (with-temp-file source (insert "def hello():\n    return 1\n" (make-string 10000 ?x)))
      (neo-diredy--render-preview source)
      (with-current-buffer neo-diredy--preview

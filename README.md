@@ -82,9 +82,15 @@ https://github.com/siroio/neo-diredy
 
 プレビューには専用バッファを使います。編集中のバッファを再利用せず、未保存の変更も破棄しません。ファイルのローカル変数や編集用フックも実行しません。
 
-テキストは拡張子・shebangで言語を判定し、現在のテーマの構文色で表示します。Emacs Lisp、Python、C/C++、C#、Java、JavaScript/JSX、JSON、HTML/XML/SVG、CSSに対応します。`markdown-mode`・`go-mode` が `load-path` 上で利用できればMarkdown・Goも色付けします。追加パッケージやTree-sitter文法の自動インストールは行いません。
+テキストは拡張子・ファイル名・shebangで言語を判定し、現在のテーマの構文色で表示します。Emacs Lisp、Python、C/C++、C#、Java、JavaScript/JSX、JSON、HTML/XML/SVG、CSSに加え、Ruby、Shell、SQL、LaTeX、Makefile、INI、Batch、Perl、Org、Git ignoreに対応します。Luaは標準または導入済みのモードを利用します。`.cc`・`.cxx`・`.hh`・`.hxx`、`.mjs`・`.cjs`、`.pyw`・`.pyi`、`.markdown`・`.mdown`、`.htm`・`.xaml`も判定します。`Makefile`・`Gemfile`・`.bashrc`・`.zshrc`などの名前にも対応します。
 
-色付けには隔離した一時バッファを使い、文字のfaceだけを本文へコピーします。ファイル内のモード指定、ユーザーの編集フック、Markdownコードブロック内の言語モードは実行しません。未対応の言語、色付けエラー、2000文字を超える行を含むプレビューは通常のテキスト表示になります。処理対象は本文の読込上限内に限ります。
+Tree-sitter対応モードと必要な文法が利用可能なら、Python、C/C++、C#、Java、JavaScript/JSX、JSON、CSS、Ruby、Bash/sh、Go、Lua、TypeScript/TSX、Rust、YAML、TOML、PHPではTree-sitterを優先します。文法の検索にはEmacs標準の検索先と設定済みの `treesit-extra-load-path` をそのまま使います。TypeScript/TSXは両方の文法、JavaScript/JSXは `javascript` と `jsdoc`、PHPは `php`・`phpdoc`・`html`・`javascript`・`jsdoc`・`css` が必要です。Emacsの版や文法の互換性によって利用できない場合は、従来のモードへ戻します。
+
+Markdown、Go、TypeScript/TSX、Rust、PHP、PowerShell、YAML、Fishの従来モードは、対応パッケージが `load-path` 上で利用できる場合に使います。TOMLには標準の `conf-toml-mode` も利用します。追加パッケージやTree-sitter文法の自動インストールは行いません。利用可能なモードがない場合は通常のテキスト表示になります。
+
+Diff（`.diff`・`.patch`・`.rej`）は追加行・削除行・見出しを色分けし、元ファイルの読込や外部diffコマンドの実行は行いません。
+
+色付けには隔離した一時バッファを使い、文字のfaceだけを本文へコピーします。ファイル内のモード指定、ユーザーの編集フック、Markdown・Orgコードブロック内の言語モードは実行しません。従来のモードは2000文字を超える行を含むプレビューの色付けを省略しますが、Tree-sitterでは長い行も色付けします。処理対象は本文の読込上限内に限り、色付けに失敗しても本文は表示します。
 
 | 項目 | 既定値 |
 | --- | --- |
@@ -143,6 +149,7 @@ emacs -Q --batch -l tests/neo-diredy-interop-tests.el -f ert-run-tests-batch-and
 emacs -Q --batch -l tests/neo-diredy-details-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-modeline-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-syntax-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-treesit-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-navigation-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/check-package.el
 emacs -Q --batch -l benchmarks/run.el
@@ -153,6 +160,8 @@ Evil連携のキー操作も確認する場合は、既存パッケージを読�
 ```powershell
 emacs -Q --batch -l tests/neo-diredy-evil-tests.el -f ert-run-tests-batch-and-exit
 ```
+
+Tree-sitterの実文法を使うテストでは、環境変数 `NEO_DIREDY_TEST_GRAMMARS` に導入済み文法のディレクトリを指定できます。文法のインストールは行わず、必要な文法がないテストはスキップします。
 
 テスト用データは `tests/` 内、計測用データは `.bench/` 内に一時作成し、実行後にその実行で作ったディレクトリだけを削除します。計測では2,100件の一覧を使います。隣に `emacs.d/lisp/` がある場合は、その実際のソース一覧も読み取りのみで計測します。
 
