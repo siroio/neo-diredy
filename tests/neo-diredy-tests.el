@@ -77,6 +77,26 @@
            (should (equal (file-name-as-directory child) default-directory)))
        (tab-close)))))
 
+(ert-deftest neo-diredy-wdired-headers-follow-edit-session ()
+  (dolist (finish '(wdired-finish-edit wdired-abort-changes))
+    (neo-diredy-test--with-directory
+     (neo-diredy--layout-mode 1)
+     (dired-goto-file file)
+     (wdired-change-to-wdired-mode)
+     (neo-diredy--post-command)
+     (should (string-match-p "名前変更中" (eval (cadr header-line-format) t)))
+     (with-current-buffer neo-diredy--parent
+       (let ((text (eval (cadr header-line-format) t)))
+         (should (string-match-p "C-c C-c" text))
+         (should (<= (string-width text) (window-body-width neo-diredy--left)))))
+     (should (string-match-p "C-c C-k" (neo-diredy--preview-header)))
+     (funcall finish)
+     (neo-diredy--post-command)
+     (should-not (string-match-p "名前変更中" (eval (cadr header-line-format) t)))
+     (with-current-buffer neo-diredy--parent
+       (should (equal (eval (cadr header-line-format) t) "  Parent")))
+     (should-not (string-match-p "C-c C-k" (neo-diredy--preview-header))))))
+
 (ert-deftest neo-diredy-wdired-edit-keeps-layout ()
   (neo-diredy-test--with-directory
    (neo-diredy--layout-mode 1)

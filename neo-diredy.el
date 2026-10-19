@@ -222,6 +222,12 @@ Advising its layout function does not load or require the optional package.")
       (ignore-errors (wdired-get-filename nil t))
     (dired-get-filename nil t)))
 
+(defun neo-diredy--editing-p ()
+  "Return non-nil while the central list is in a WDired edit session."
+  (and (window-live-p neo-diredy--center)
+       (with-current-buffer (window-buffer neo-diredy--center)
+         (derived-mode-p 'wdired-mode))))
+
 (defun neo-diredy--style ()
   "Temporarily style the current Dired buffer, saving its original state."
   (unless (assq (current-buffer) neo-diredy--buffers)
@@ -241,7 +247,10 @@ Advising its layout function does not load or require the optional package.")
               display-line-numbers nil
               hl-line-face 'neo-diredy-selection
               hl-line-range-function #'neo-diredy--selection-range
-              header-line-format '(:eval (concat "  " (abbreviate-file-name default-directory))))
+              header-line-format
+              '(:eval (if (neo-diredy--editing-p)
+                          (propertize "  名前変更中" 'face 'warning)
+                        (concat "  " (abbreviate-file-name default-directory)))))
   (dired-hide-details-mode 1)
   (unless neo-diredy--modeline-face
     (setq neo-diredy--modeline-face
@@ -671,16 +680,18 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
         (setq neo-diredy--details-window nil)))))
 
 (defun neo-diredy--preview-header ()
-  "Keep compact details beside the preview title when the footer cannot fit."
-  (let* ((width (max 1 (- (window-body-width neo-diredy--right) 2)))
-         (title (if (car neo-diredy--details-key)
-                    (file-name-nondirectory (car neo-diredy--details-key)) "Preview"))
-         (details (unless (window-live-p neo-diredy--details-window)
-                    (neo-diredy--details-compact (neo-diredy--details-display-data)
-                                                (max 1 (/ width 2)))))
-         (suffix (if (or (not details) (string-empty-p details)) "" (concat " | " details))))
-    (concat "  " (truncate-string-to-width title (max 0 (- width (string-width suffix))) nil nil "…")
-            suffix)))
+  "Show edit help, or compact preview details when the footer cannot fit."
+  (if (neo-diredy--editing-p)
+      "  C-c C-k 取消"
+    (let* ((width (max 1 (- (window-body-width neo-diredy--right) 2)))
+           (title (if (car neo-diredy--details-key)
+                      (file-name-nondirectory (car neo-diredy--details-key)) "Preview"))
+           (details (unless (window-live-p neo-diredy--details-window)
+                      (neo-diredy--details-compact (neo-diredy--details-display-data)
+                                                  (max 1 (/ width 2)))))
+           (suffix (if (or (not details) (string-empty-p details)) "" (concat " | " details))))
+      (concat "  " (truncate-string-to-width title (max 0 (- width (string-width suffix))) nil nil "…")
+              suffix))))
 
 (defun neo-diredy--details-resize (frame)
   "Refit the preview and details after FRAME changes size."
@@ -1278,7 +1289,8 @@ stay plain."
             (with-current-buffer neo-diredy--parent
               (let ((inhibit-read-only t))
                 (erase-buffer)
-                (setq header-line-format "  Parent")
+                (setq header-line-format
+                      '(:eval (if (neo-diredy--editing-p) "  C-c C-c 確定" "  Parent")))
                 (condition-case err
                     (neo-diredy--listing (file-name-directory (directory-file-name directory)) directory)
                   (error (insert (error-message-string err))))
@@ -1321,6 +1333,9 @@ stay plain."
         (neo-diredy--style)
         (let ((key (list (current-buffer) major-mode (point) (buffer-chars-modified-tick))))
           (unless (equal key neo-diredy--key)
+            ;; Edit help in auxiliary buffers must follow mode changes too.
+            (unless (eq major-mode (cadr neo-diredy--key))
+              (force-mode-line-update t))
             (neo-diredy--art-cancel)
             (neo-diredy--details-cancel)
             (let ((job (cdr (assq 'size neo-diredy--metadata-jobs))))
