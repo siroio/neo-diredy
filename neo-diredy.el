@@ -28,6 +28,9 @@
 (require 'tab-bar)
 (declare-function dired-preview-mode "dired-preview" (&optional arg))
 (declare-function wdired-get-filename "wdired" (&optional no-dir old))
+(declare-function evil-append "evil-commands" (count &optional vcount skip-empty-lines))
+(declare-function evil-define-key* "evil-core" (state keymap key def &rest bindings))
+(declare-function evil-normalize-keymaps "evil-core" (&optional force))
 (defvar markdown-fontify-code-blocks-natively)
 (defvar diff-font-lock-syntax)
 (defvar diff-font-lock-prettify)
@@ -228,6 +231,23 @@ Advising its layout function does not load or require the optional package.")
        (with-current-buffer (window-buffer neo-diredy--center)
          (derived-mode-p 'wdired-mode))))
 
+(defun neo-diredy--append-name (count)
+  "Start a WDired session and append after point COUNT times with Evil."
+  (interactive "p")
+  (unless (derived-mode-p 'wdired-mode)
+    (dired-toggle-read-only))
+  (evil-append count))
+
+(define-minor-mode neo-diredy--edit-keys-mode
+  "Use Evil editing entry keys in buffers owned by the active layout."
+  :keymap (make-sparse-keymap)
+  (when (fboundp 'evil-normalize-keymaps)
+    (evil-normalize-keymaps)))
+
+(with-eval-after-load 'evil
+  (when (boundp 'neo-diredy--edit-keys-mode-map)
+    (evil-define-key* 'normal neo-diredy--edit-keys-mode-map "a" #'neo-diredy--append-name)))
+
 (defun neo-diredy--style ()
   "Temporarily style the current Dired buffer, saving its original state."
   (unless (assq (current-buffer) neo-diredy--buffers)
@@ -242,15 +262,17 @@ Advising its layout function does not load or require the optional package.")
     (add-hook 'after-change-functions #'neo-diredy--changed nil t)
     (add-hook 'dired-after-readin-hook #'neo-diredy--after-readin nil t)
     (when (bound-and-true-p dired-preview-mode) (dired-preview-mode -1)))
+  (unless neo-diredy--edit-keys-mode (neo-diredy--edit-keys-mode 1))
   (setq-local truncate-lines t
               cursor-type (when (derived-mode-p 'wdired-mode) (or cursor-type t))
               display-line-numbers nil
               hl-line-face 'neo-diredy-selection
               hl-line-range-function #'neo-diredy--selection-range
               header-line-format
-              '(:eval (if (neo-diredy--editing-p)
-                          (propertize "  名前変更中" 'face 'warning)
-                        (concat "  " (abbreviate-file-name default-directory)))))
+              '(:eval (let ((path (concat "  " (abbreviate-file-name default-directory))))
+                        (if (neo-diredy--editing-p)
+                            (propertize path 'face 'warning)
+                          path))))
   (dired-hide-details-mode 1)
   (unless neo-diredy--modeline-face
     (setq neo-diredy--modeline-face
@@ -680,18 +702,16 @@ Any unreadable entry fails the total instead of reporting a misleading sum."
         (setq neo-diredy--details-window nil)))))
 
 (defun neo-diredy--preview-header ()
-  "Show edit help, or compact preview details when the footer cannot fit."
-  (if (neo-diredy--editing-p)
-      "  C-c C-k 取消"
-    (let* ((width (max 1 (- (window-body-width neo-diredy--right) 2)))
-           (title (if (car neo-diredy--details-key)
-                      (file-name-nondirectory (car neo-diredy--details-key)) "Preview"))
-           (details (unless (window-live-p neo-diredy--details-window)
-                      (neo-diredy--details-compact (neo-diredy--details-display-data)
-                                                  (max 1 (/ width 2)))))
-           (suffix (if (or (not details) (string-empty-p details)) "" (concat " | " details))))
-      (concat "  " (truncate-string-to-width title (max 0 (- width (string-width suffix))) nil nil "…")
-              suffix))))
+  "Keep compact details beside the preview title when the footer cannot fit."
+  (let* ((width (max 1 (- (window-body-width neo-diredy--right) 2)))
+         (title (if (car neo-diredy--details-key)
+                    (file-name-nondirectory (car neo-diredy--details-key)) "Preview"))
+         (details (unless (window-live-p neo-diredy--details-window)
+                    (neo-diredy--details-compact (neo-diredy--details-display-data)
+                                                (max 1 (/ width 2)))))
+         (suffix (if (or (not details) (string-empty-p details)) "" (concat " | " details))))
+    (concat "  " (truncate-string-to-width title (max 0 (- width (string-width suffix))) nil nil "…")
+            suffix)))
 
 (defun neo-diredy--details-resize (frame)
   "Refit the preview and details after FRAME changes size."
@@ -1289,8 +1309,7 @@ stay plain."
             (with-current-buffer neo-diredy--parent
               (let ((inhibit-read-only t))
                 (erase-buffer)
-                (setq header-line-format
-                      '(:eval (if (neo-diredy--editing-p) "  C-c C-c 確定" "  Parent")))
+                (setq header-line-format "  Parent")
                 (condition-case err
                     (neo-diredy--listing (file-name-directory (directory-file-name directory)) directory)
                   (error (insert (error-message-string err))))
@@ -1333,9 +1352,6 @@ stay plain."
         (neo-diredy--style)
         (let ((key (list (current-buffer) major-mode (point) (buffer-chars-modified-tick))))
           (unless (equal key neo-diredy--key)
-            ;; Edit help in auxiliary buffers must follow mode changes too.
-            (unless (eq major-mode (cadr neo-diredy--key))
-              (force-mode-line-update t))
             (neo-diredy--art-cancel)
             (neo-diredy--details-cancel)
             (let ((job (cdr (assq 'size neo-diredy--metadata-jobs))))
@@ -1396,6 +1412,7 @@ stay plain."
   (dolist (entry neo-diredy--buffers)
     (when (buffer-live-p (car entry))
       (with-current-buffer (car entry)
+        (neo-diredy--edit-keys-mode -1)
         (remove-hook 'after-change-functions #'neo-diredy--changed t)
         (remove-hook 'dired-after-readin-hook #'neo-diredy--after-readin t)
         (kill-local-variable 'neo-diredy--file-sizes)
