@@ -1514,6 +1514,125 @@ FILE is used only to recognize shell variants, never visited."
                   spans))))))
     (error nil)))
 
+(defface neo-diredy-diff-added
+  '((((class color) (background dark)) (:background "#19352b" :extend t))
+    (((class color) (background light)) (:background "#e2f3e5" :extend t))
+    (t (:inherit diff-added)))
+  "Quiet background for added lines." :group 'neo-diredy)
+(defface neo-diredy-diff-removed
+  '((((class color) (background dark)) (:background "#3c242b" :extend t))
+    (((class color) (background light)) (:background "#fbe4e7" :extend t))
+    (t (:inherit diff-removed)))
+  "Quiet background for removed lines." :group 'neo-diredy)
+(defface neo-diredy-diff-refine-added
+  '((((class color) (background dark)) (:background "#286749" :weight bold))
+    (((class color) (background light)) (:background "#aadbb5" :weight bold))
+    (t (:inherit diff-refine-added :weight bold)))
+  "Emphasize changed text within added lines." :group 'neo-diredy)
+(defface neo-diredy-diff-refine-removed
+  '((((class color) (background dark)) (:background "#803e4b" :weight bold))
+    (((class color) (background light)) (:background "#f0acb7" :weight bold))
+    (t (:inherit diff-refine-removed :weight bold)))
+  "Emphasize changed text within removed lines." :group 'neo-diredy)
+(defface neo-diredy-diff-file-header
+  '((t (:inherit font-lock-function-name-face :weight bold :overline t :extend t)))
+  "Separate file headers from diff contents." :group 'neo-diredy)
+(defface neo-diredy-diff-hunk-header
+  '((t (:inherit font-lock-keyword-face :weight bold :extend t)))
+  "Highlight hunk locations and their function context." :group 'neo-diredy)
+(defvar-local neo-diredy--diff-faces-installed nil)
+
+(defun neo-diredy--refine-diff-lines (removed added)
+  "Emphasize the changed middle of corresponding REMOVED and ADDED lines."
+  ;; shortcut: unequal blocks keep line shading; add alignment if finer pairing is needed.
+  (when (= (length removed) (length added))
+    (cl-mapc
+     (lambda (before after)
+       (let* ((a (buffer-substring-no-properties (car before) (cdr before)))
+              (b (buffer-substring-no-properties (car after) (cdr after)))
+              (start 0) (a-end (length a)) (b-end (length b)))
+         (while (and (< start a-end) (< start b-end) (= (aref a start) (aref b start)))
+           (cl-incf start))
+         (while (and (> a-end start) (> b-end start)
+                     (= (aref a (1- a-end)) (aref b (1- b-end))))
+           (cl-decf a-end) (cl-decf b-end))
+         (when (< start a-end)
+           (add-face-text-property (+ (car before) start) (+ (car before) a-end)
+                                   'diff-refine-removed))
+         (when (< start b-end)
+           (add-face-text-property (+ (car after) start) (+ (car after) b-end)
+                                   'diff-refine-added))))
+     (nreverse removed) (nreverse added))))
+
+(defun neo-diredy--decorate-diff ()
+  "Decorate unified diff text without changing characters or buffer positions."
+  (unless neo-diredy--diff-faces-installed
+    (dolist (face '(diff-added diff-removed diff-refine-added diff-refine-removed
+                   diff-file-header diff-hunk-header))
+      (face-remap-add-relative face (intern (concat "neo-diredy-" (symbol-name face)))))
+    (setq neo-diredy--diff-faces-installed t))
+  (save-excursion
+    (save-match-data
+      (with-silent-modifications
+        (remove-text-properties (point-min) (point-max) '(line-prefix nil wrap-prefix nil))
+        (let ((header "^@@ -\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? [+]\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? @@")
+              (width 3) (old 0) (new 0) (old-left 0) (new-left 0)
+              number-format removed-lines added-lines)
+          (goto-char (point-min))
+          (while (re-search-forward header nil t)
+            (setq width (max width
+                             (length (number-to-string
+                                      (+ (string-to-number (match-string 1))
+                                         (string-to-number (or (match-string 2) "1")))))
+                             (length (number-to-string
+                                      (+ (string-to-number (match-string 3))
+                                         (string-to-number (or (match-string 4) "1"))))))))
+          (goto-char (point-min))
+          (setq number-format (format "%%%ds %%%ds │ " width width))
+          (while (not (eobp))
+            (let* ((beg (point)) (end (line-end-position))
+                   (next (min (point-max) (1+ end))) prefix)
+              (cond
+               ((looking-at header)
+                (neo-diredy--refine-diff-lines removed-lines added-lines)
+                (setq removed-lines nil added-lines nil)
+                (setq old (string-to-number (match-string 1))
+                      old-left (string-to-number (or (match-string 2) "1"))
+                      new (string-to-number (match-string 3))
+                      new-left (string-to-number (or (match-string 4) "1"))
+                      prefix (format number-format "old" "new")))
+               ((or (and (eq (char-after) ?-) (> old-left 0))
+                    (and (eq (char-after) ?+) (> new-left 0))
+                    (and (eq (char-after) ?\s) (> old-left 0) (> new-left 0)))
+                (let ((removed (eq (char-after) ?-)) (added (eq (char-after) ?+)))
+                  (setq prefix (format number-format
+                                       (if added "" (number-to-string old))
+                                       (if removed "" (number-to-string new))))
+                  (put-text-property beg next 'face
+                                     (cond (removed 'diff-removed)
+                                           (added 'diff-added) (t 'diff-context)))
+                  (cond (removed
+                         (when added-lines
+                           (neo-diredy--refine-diff-lines removed-lines added-lines)
+                           (setq removed-lines nil added-lines nil))
+                         (push (cons (1+ beg) end) removed-lines))
+                        (added (push (cons (1+ beg) end) added-lines))
+                        (t (neo-diredy--refine-diff-lines removed-lines added-lines)
+                           (setq removed-lines nil added-lines nil)))
+                  (unless added (cl-incf old) (cl-decf old-left))
+                  (unless removed (cl-incf new) (cl-decf new-left))))
+               ((looking-at "\\\\ No newline at end of file") nil)
+               (t (neo-diredy--refine-diff-lines removed-lines added-lines)
+                (setq removed-lines nil added-lines nil) (setq old-left 0 new-left 0)))
+              (when prefix
+                (put-text-property beg next 'line-prefix (propertize prefix 'face 'shadow))
+                (put-text-property beg next 'wrap-prefix
+                                   (propertize (concat (make-string (1+ (* 2 width)) ?\s) " │ ")
+                                               'face 'shadow)))
+              (forward-line 1)))
+          (neo-diredy--refine-diff-lines removed-lines added-lines))))))
+
+
 (defun neo-diredy--fontify-preview (file)
   "Copy syntax faces for FILE into the current bounded text preview.
 Do not visit FILE, use file-local settings, or run editing hooks.
@@ -1542,7 +1661,8 @@ stay plain."
                    (neo-diredy--preview-faces text native file))
                  (when (and mode short-lines) (neo-diredy--preview-faces text mode file)))))
         (dolist (span faces)
-          (put-text-property (car span) (cadr span) 'face (nth 2 span)))))))
+          (put-text-property (car span) (cadr span) 'face (nth 2 span)))))
+    (when (equal language "Diff") (neo-diredy--decorate-diff))))
 
 (defun neo-diredy--insert-preview (file attributes)
   "Render FILE without visiting it or evaluating file-local code."
@@ -1607,7 +1727,10 @@ stay plain."
                     (progn (erase-buffer) (insert (format "Binary file (%s)" (file-size-human-readable size))))
                   (neo-diredy--fontify-preview file)
                   (when (> size neo-diredy-preview-bytes)
-                    (goto-char (point-max)) (insert "\n… preview truncated"))))))))
+                    (goto-char (point-max))
+                    (let ((start (point)))
+                      (insert "\n… preview truncated")
+                      (set-text-properties start (point) nil)))))))))
         (error (setq neo-diredy--preview-key nil)
                (erase-buffer) (insert (error-message-string error-data)))))
     (goto-char (point-min))

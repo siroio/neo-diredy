@@ -114,6 +114,22 @@
                                (and (listp face) (memq (cdr sample) face)))))))))))
      (should-not side-effect))))
 
+(ert-deftest neo-diredy-syntax-truncated-diff-does-not-number-the-notice ()
+  (neo-diredy-test--with-directory
+   (neo-diredy--layout-mode 1)
+   (let ((source (expand-file-name "sample.diff" root))
+         (coding-system-for-write 'utf-8-unix)
+         (neo-diredy-preview-bytes (length "@@ -1 +1 @@\n-old\n+new")))
+     (with-temp-file source (insert "@@ -1 +1 @@\n-old\n+new value\n"))
+     (neo-diredy--render-preview source)
+     (with-current-buffer neo-diredy--preview
+       (goto-char (point-min))
+       (search-forward "+new")
+       (should (get-text-property (1- (point)) 'line-prefix))
+       (search-forward "preview truncated")
+       (should-not (get-text-property (1- (point)) 'line-prefix))
+       (should-not (get-text-property (1- (point)) 'face))))))
+
 ;; Optional installed packages are read only; never install or load user init.
 (let ((directory (or (getenv "NEO_DIREDY_TEST_ELPA")
                      (expand-file-name "../../emacs.d/elpa" neo-diredy-test-root))))
