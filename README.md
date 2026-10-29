@@ -57,6 +57,75 @@ https://github.com/siroio/neo-diredy
 - 配色は現在のテーマを継承します。選択行は `neo-diredy-selection` faceで調整できます。
 - modelineは設定済みの `mode-line-format` を変更せず、3ペイン全体の下部左端から表示します。行・桁、メジャーモード、文字コード、画像など、通常の表示をそのまま使います。modelineは同じDiredバッファを表示する専用ウィンドウに置き、中央のカーソル位置と同期します。`%p` などウィンドウの表示範囲に依存する項目は、下部ウィンドウを基準に計算されます。
 
+## 開くアプリを選ぶ
+
+GUI版Emacsでは、中央の項目で `Shift+Enter`（テンキーも対応）を押すと、
+開き方の候補をchild-frameに表示します。上下キー・`j` / `k`・`C-n` / `C-p`で選び、
+Enterで起動、Esc・`C-g`で取り消します。マウスクリックでもメニューを閉じられます。
+通常のEnterは従来のDired操作のままです。対象はカーソル位置の1項目で、マークした項目の一括起動は行いません。
+
+Windowsでは次の2つを最初から選べます。
+
+- `Windows default app`: Windowsの関連付けで開きます。
+- `Show in Explorer`: ファイルを所在フォルダーで選択します。フォルダーの場合はその中を開きます。
+
+追加アプリは `M-x customize-option RET neo-diredy-openers`、またはEmacsの設定で登録できます。
+項目は **表示名・拡張子のリスト・実行ファイル・引数のリスト** です。例えば、以下のパスを
+自分のアプリに置き換えて使います。これらのアプリを自動設定・導入することはありません。
+
+```elisp
+(setq neo-diredy-openers
+      '(("Image editor" ("png" "jpg" "jpeg") "C:/Apps/ImageEditor/editor.exe" nil)
+        ("Text editor" ("txt" "md" "el") "C:/Apps/TextEditor/editor.exe" ("--new-window"))))
+```
+
+拡張子は先頭のドットを付けず、大文字・小文字を区別しません。`"tar.gz"`のような複合拡張子も使えます。
+拡張子のリストを `nil` にすると、ファイル・フォルダー共通の候補になります。
+実行ファイルには絶対パスまたはPATHで見つかる名前を指定し、表示名は重複させないでください。
+引数の後ろに対象の絶対パスを1つの引数として渡します。シェル展開や `%f` などの置換は行いません。
+Windowsの `.bat` / `.cmd` は登録できません。アプリの実行ファイルを指定してください。
+追加アプリとExplorerでのファイル選択にはWindowsのシステム文字コードを使います。
+その文字コードで表せない文字（環境によっては絵文字など）を含むパス・引数は、文字化けを防ぐためエラーにします。
+この場合は `Windows default app` で開けます。
+端末内で操作するアプリには、必要に応じてターミナルを起動するコマンドを登録してください。
+
+Yaziの設定や登録済みデータは読み込みません。WDiredで名前変更中の場合は確定・取消を先に行ってください。
+リモートファイルと端末版Emacsのメニュー表示には対応しません。
+
+## ブックマーク
+
+現在表示しているフォルダーを、名前を付けて登録できます。
+
+| キー | 操作 |
+| --- | --- |
+| `C-c b a` | 現在のフォルダーを登録 |
+| `C-c b j` | child-frameの一覧から選んで移動 |
+| `C-c b d` | child-frameの一覧から選んで登録を削除 |
+
+一覧は上下キー・`j` / `k`で選び、Enterで決定、Escで取り消します。
+表示するのはneo-diredyで登録した項目です。同名の既存ブックマークは上書きしません。
+保存先と保存タイミングはEmacs標準の `bookmark-default-file`・`bookmark-save-flag` に従います。
+必要なら `M-x bookmark-save` ですぐ保存できます。Yaziのブックマークは読み込みません。
+登録対象はローカルのフォルダーです。名前変更中は先に確定・取消してください。
+
+## プレビュー操作とバッファ整理
+
+| キー | 操作 |
+| --- | --- |
+| `Alt+↓` / `Alt+↑` | 中央の選択を動かさず、プレビューを前後に5行スクロール |
+| `C-c p` | プレビューをウィンドウ全体に表示 |
+| 大きな表示で `q` / Esc / `C-c p` | 表示を閉じ、同じDiredの選択位置へ戻る |
+
+スクロール量は数値の前置引数で指定できます。大きな表示は読み取り専用のスナップショットです。
+元ファイルは編集用に開かず、構文色やプレビューの読込上限を引き継ぎます。画像は大きな表示領域に合わせます。
+読み込み中の画像は完了後に開いてください。画像の拡大率を手動で変える操作はありません。
+これらのキーとブックマーク用のキーは、Evilでもneo-diredyの表示中だけ有効です。
+
+3カラム表示が終了すると、その間のフォルダー移動で増えた未使用のDiredバッファを閉じます。
+元から開いていたバッファ、最後に表示していた一覧（ファイルを開いた後の戻り先）、編集中・WDired中・マーク付きの一覧、別フレームや保存タブで
+使っている一覧は残します。プレビュー用の補助バッファ・タイマー・バックグラウンド処理も従来どおり片付けます。
+通常のDiredの終了操作や、ファイルの編集バッファは変更しません。
+
 ## サイズとGit状態
 
 中央の各行の右端に容量と2文字のGit状態を表示します。本文の中央寄せなど、他の設定が余白を調整しても、neo-diredyの中央一覧では右端の状態欄を確保します。中央ペインの幅が32桁未満の場合は右端の欄を省略しますが、選択項目の容量・Git情報は右ペインの詳細欄で確認できます。ファイル名は通常のDiredのままで、長い名前やWDiredの編集欄に表示用の文字を混ぜません。
@@ -152,6 +221,8 @@ emacs -Q --batch -l tests/neo-diredy-modeline-tests.el -f ert-run-tests-batch-an
 emacs -Q --batch -l tests/neo-diredy-syntax-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-treesit-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-navigation-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-open-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-workflow-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/check-package.el
 emacs -Q --batch -l benchmarks/run.el
 ```
@@ -163,6 +234,10 @@ emacs -Q --batch -l tests/neo-diredy-evil-tests.el -f ert-run-tests-batch-and-ex
 ```
 
 Tree-sitterの実文法を使うテストでは、環境変数 `NEO_DIREDY_TEST_GRAMMARS` に導入済み文法のディレクトリを指定できます。文法のインストールは行わず、必要な文法がないテストはスキップします。
+
+openerのテストでは外部アプリ起動を代替して引数とエラーを確認します。child-frameの表示・選択・後始末は
+GUI版Emacsで `tests/neo-diredy-open-tests.el` を読み込み、`M-x ert RET neo-diredy-open-child-frame- RET` で確認できます。
+これらのGUIテストはバッチ実行時にはスキップします。
 
 テスト用データは `tests/` 内、計測用データは `.bench/` 内に一時作成し、実行後にその実行で作ったディレクトリだけを削除します。計測では2,100件の一覧を使います。隣に `emacs.d/lisp/` がある場合は、その実際のソース一覧も読み取りのみで計測します。
 

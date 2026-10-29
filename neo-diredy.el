@@ -26,6 +26,7 @@
 (require 'json)
 (require 'sqlite)
 (require 'tab-bar)
+(require 'bookmark)
 (declare-function dired-preview-mode "dired-preview" (&optional arg))
 (declare-function wdired-get-filename "wdired" (&optional no-dir old))
 (declare-function evil-append "evil-commands" (count &optional vcount skip-empty-lines))
@@ -49,6 +50,7 @@
 (defvar org-startup-with-latex-preview)
 (defvar compilation-error-regexp-alist)
 (defvar compilation-error-regexp-alist-alist)
+(defvar w32-quote-process-args)
 
 (defgroup neo-diredy nil "Three-column Dired view." :group 'dired)
 (defcustom neo-diredy-preview-bytes (* 64 1024)
@@ -63,6 +65,18 @@
 (defcustom neo-diredy-git-status t
   "Read Git status asynchronously when Git is available."
   :type 'boolean :group 'neo-diredy)
+(defcustom neo-diredy-openers nil
+  "Additional opening methods as (LABEL EXTENSIONS PROGRAM ARGUMENTS).
+EXTENSIONS are matched case-insensitively, without the leading dot;
+an empty list matches files and directories.  PROGRAM is an executable
+name or absolute path.  ARGUMENTS are literal strings, followed by the
+selected absolute path as one argument.  No shell is used; Windows batch
+scripts are not supported."
+  :type '(repeat (list (string :tag "Label")
+                       (repeat :tag "Extensions (empty means all)" string)
+                       (string :tag "Executable")
+                       (repeat :tag "Arguments" string)))
+  :group 'neo-diredy)
 (defface neo-diredy-selection
   '((t (:inherit highlight :extend t))) "Selected file row.")
 
@@ -80,6 +94,7 @@
 (defvar neo-diredy--handoff nil
   "Selection and window contents held until navigation after a handoff.")
 (defvar neo-diredy--buffers nil)
+(defvar neo-diredy--existing-buffers nil)
 (defvar neo-diredy--overlays nil)
 (defvar neo-diredy--selected-icon nil)
 (defvar neo-diredy--timer nil)
@@ -106,6 +121,7 @@
 (defvar-local neo-diredy--file-sizes nil)
 (defvar-local neo-diredy--modeline-face nil)
 (defvar-local neo-diredy--listing-dirty t)
+(defvar-local neo-diredy--preview-origin nil)
 (defvar w32-get-true-file-attributes)
 (defconst neo-diredy--layout-commands
   '(tab-bar-new-tab tab-bar-select-tab tab-bar-close-tab neo-git--layout)
@@ -231,6 +247,210 @@ Advising its layout function does not load or require the optional package.")
        (with-current-buffer (window-buffer neo-diredy--center)
          (derived-mode-p 'wdired-mode))))
 
+(defun neo-diredy--open-choices (file)
+  "Return labelled opening methods for FILE."
+  (let* ((choices (when (eq system-type 'windows-nt)
+                    '(("Windows default app" . default) ("Show in Explorer" . explorer))))
+         (labels (mapcar #'car choices))
+         (directory (file-directory-p file)))
+    (unless (proper-list-p neo-diredy-openers)
+      (user-error "neo-diredy-openers must be a list"))
+    (dolist (entry neo-diredy-openers)
+      (unless (and (proper-list-p entry) (= (length entry) 4)
+                   (stringp (nth 0 entry)) (not (string-empty-p (nth 0 entry)))
+                   (proper-list-p (nth 1 entry)) (cl-every #'stringp (nth 1 entry))
+                   (stringp (nth 2 entry)) (not (string-empty-p (nth 2 entry)))
+                   (proper-list-p (nth 3 entry)) (cl-every #'stringp (nth 3 entry)))
+        (user-error "Invalid neo-diredy opener: %S" entry))
+      (pcase-let ((`(,label ,extensions ,program ,arguments) entry))
+        (when (member label labels) (user-error "Duplicate opener label: %s" label))
+        (push label labels)
+        (when (or (null extensions)
+                  (and (not directory)
+                       (cl-some (lambda (extension)
+                                  (string-suffix-p (concat "." extension) file t))
+                                extensions)))
+          (setq choices (append choices (list (cons label (cons program arguments))))))))
+    choices))
+
+(defun neo-diredy--check-open-file (file)
+  "Reject a missing or remote FILE before opening it externally."
+  (when (file-remote-p file) (user-error "Openers require a local file"))
+  (unless (file-exists-p file) (user-error "File no longer exists: %s" file)))
+
+(defun neo-diredy--open-file (file action)
+  "Open FILE using ACTION, with literal process arguments."
+  (neo-diredy--check-open-file file)
+  (condition-case err
+      (if (and (memq action '(default explorer))
+               (not (and (eq system-type 'windows-nt) (fboundp 'w32-shell-execute))))
+          (user-error "This opening method requires Windows")
+        (let ((native (subst-char-in-string ?/ ?\\ file)))
+          (cond
+           ((eq action 'default) (w32-shell-execute "open" native))
+           ((and (eq action 'explorer) (file-directory-p file))
+            (w32-shell-execute "explore" native))
+           (t
+            (let* ((command (if (eq action 'explorer)
+                                (list "explorer.exe" "/select," native)
+                              (append action (list file))))
+                   (program (executable-find (car command)))
+                   (coding-system-for-write (if (eq system-type 'windows-nt)
+                                                locale-coding-system coding-system-for-write))
+                   (w32-quote-process-args t))
+              (unless program (user-error "Opener program not found: %s" (car command)))
+              (when (eq system-type 'windows-nt)
+                (when (member (downcase (or (file-name-extension program) "")) '("bat" "cmd"))
+                  (user-error "Use an executable opener, not a Windows batch script"))
+                ;; shortcut: Windows ANSI arguments; add a Unicode launcher if broader paths are needed.
+                (dolist (argument (cons program (cdr command)))
+                  (unless (equal argument (decode-coding-string
+                                           (encode-coding-string argument locale-coding-system)
+                                           locale-coding-system))
+                    (user-error "This opener cannot represent the path or arguments in %s; use Windows default app"
+                                locale-coding-system))))
+              (if (eq action 'explorer)
+                  (w32-shell-execute "open" program (concat "/select,\"" native "\""))
+                (make-process
+                 :name "neo-diredy-opener" :buffer nil :noquery t :connection-type 'pipe
+                 :command (cons program (cdr command))
+                 :sentinel (lambda (process event)
+                             (when (and (memq (process-status process) '(exit signal))
+                                        (/= (process-exit-status process) 0))
+                               (message "neo-diredy: %s: %s" (car command)
+                                        (string-trim event)))))))))))
+    (error (user-error "Could not open %s: %s" (file-name-nondirectory file)
+                       (error-message-string err)))))
+
+(defun neo-diredy--read-choice (title choices)
+  "Select one of CHOICES under TITLE in a child frame, or return nil."
+  (unless (display-graphic-p) (user-error "This menu requires a graphical frame"))
+  (unless choices (user-error "No choices available"))
+  (let* ((parent (selected-frame))
+         (width (min (- (frame-width parent) 4)
+                     (max 44 (+ 4 (apply #'max (mapcar (lambda (choice)
+                                                        (string-width (car choice))) choices))))))
+         (height (min (max 5 (- (frame-height parent) 6)) (+ 4 (length choices))))
+         (buffer (generate-new-buffer " *neo-diredy-choices*"))
+         (index 0) popup)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (delay-mode-hooks (special-mode))
+            (setq-local mode-line-format nil header-line-format nil tab-line-format nil
+                        display-line-numbers nil truncate-lines nil cursor-type nil))
+          (setq popup
+                (make-frame
+                 `((parent-frame . ,parent) (minibuffer . nil) (visibility . nil)
+                   (undecorated . t) (no-accept-focus . t) (no-focus-on-map . t)
+                   (no-other-frame . t) (skip-taskbar . t) (desktop-dont-save . t)
+                   (menu-bar-lines . 0) (tool-bar-lines . 0) (tab-bar-lines . 0)
+                   (vertical-scroll-bars . nil) (horizontal-scroll-bars . nil)
+                   (left-fringe . 0) (right-fringe . 0) (internal-border-width . 8)
+                   (child-frame-border-width . 1) (min-width . 1) (min-height . 1)
+                   (font . ,(frame-parameter parent 'font))
+                   (background-color . ,(face-background 'default parent t))
+                   (foreground-color . ,(face-foreground 'default parent t))
+                   (width . ,width) (height . ,height))))
+          (set-window-buffer (frame-root-window popup) buffer)
+          (catch 'chosen
+            (while (and (frame-live-p parent) (frame-live-p popup))
+              (set-frame-height
+               popup (min (max 5 (- (frame-height parent) 6))
+                          (+ 3 (length choices)
+                             (ceiling (+ 2 (string-width (car (nth index choices)))) (max 1 (1- width))))))
+              (set-frame-position popup
+                                  (max 0 (/ (- (frame-pixel-width parent) (frame-pixel-width popup)) 2))
+                                  (max 0 (/ (- (frame-pixel-height parent) (frame-pixel-height popup)) 2)))
+              (with-current-buffer buffer
+                (let ((inhibit-read-only t))
+                  (erase-buffer)
+                  (insert (propertize
+                           (truncate-string-to-width
+                            title
+                            width nil nil t) 'face 'bold) "\n\n")
+                  (cl-loop for choice in choices for row from 0 do
+                           (insert (propertize
+                                    (concat (if (= row index) "› " "  ")
+                                            (if (= row index) (car choice)
+                                              (truncate-string-to-width (car choice) (- width 2) nil nil t))
+                                            "\n")
+                                    'face (if (= row index) 'highlight 'default))))
+                  (insert (propertize "\n↑↓/j k: select   Enter: confirm   Esc: cancel" 'face 'shadow))
+                  (goto-char (point-min))
+                  (forward-line (+ 2 index))
+                  (set-window-point (frame-root-window popup) (point))))
+              (unless (frame-visible-p popup) (make-frame-visible popup))
+              (redisplay t)
+              (let ((event (read-key nil t)))
+                (pcase event
+                  ((or 'down ?j ?\C-n) (setq index (mod (1+ index) (length choices))))
+                  ((or 'up ?k ?\C-p) (setq index (mod (1- index) (length choices))))
+                  ((or 'return 'kp-enter ?\r) (throw 'chosen (nth index choices)))
+                  ((or 'escape ?\e ?\C-g) (throw 'chosen nil))
+                  (_ (when (or (mouse-event-p event) (eq (car-safe event) 'switch-frame))
+                       (throw 'chosen nil))))))))
+      (when (frame-live-p popup) (delete-frame popup t))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+;;;###autoload
+(defun neo-diredy-open ()
+  "Choose an opening method for the Dired item at point in a child frame."
+  (interactive)
+  (unless (derived-mode-p 'dired-mode) (user-error "Use this command in Dired"))
+  (when (derived-mode-p 'wdired-mode) (user-error "Finish or cancel renaming first"))
+  ;; shortcut: open the item at point; add marked-file dispatch when requested.
+  (let ((file (dired-get-filename nil t)))
+    (unless file (user-error "No file on this line"))
+    (neo-diredy--check-open-file file)
+    (when-let* ((choice (neo-diredy--read-choice
+                        (concat "Open: " (file-name-nondirectory (directory-file-name file)))
+                        (neo-diredy--open-choices file))))
+      (neo-diredy--open-file file (cdr choice)))))
+
+(defun neo-diredy--bookmark-choices ()
+  "Return the directory bookmarks created by neo-diredy."
+  (bookmark-maybe-load-default-file)
+  (cl-loop for record in bookmark-alist
+           for path = (bookmark-get-filename record)
+           when (and (bookmark-prop-get record 'neo-diredy) (stringp path))
+           collect (cons (format "%s — %s" (car record) (abbreviate-file-name path)) (car record))))
+
+;;;###autoload
+(defun neo-diredy-bookmark-add (name)
+  "Bookmark the current local Dired directory as NAME."
+  (interactive (list (read-string "Bookmark directory as: "
+                                  (file-name-nondirectory (directory-file-name default-directory)))))
+  (unless (derived-mode-p 'dired-mode) (user-error "Use this command in Dired"))
+  (when (derived-mode-p 'wdired-mode) (user-error "Finish or cancel renaming first"))
+  (when (file-remote-p default-directory) (user-error "Bookmarks require a local directory"))
+  (neo-diredy--check-open-file default-directory)
+  (setq name (string-trim name))
+  (when (string-empty-p name) (user-error "Enter a bookmark name"))
+  (bookmark-maybe-load-default-file)
+  (when (bookmark-get-bookmark name t) (user-error "Bookmark already exists: %s" name))
+  (bookmark-store name `((filename . ,default-directory) (position . 1) (neo-diredy . t)) nil)
+  (message "Bookmark added: %s" name))
+
+;;;###autoload
+(defun neo-diredy-bookmark-jump ()
+  "Choose a directory bookmark in a child frame and visit it."
+  (interactive)
+  (when (derived-mode-p 'wdired-mode) (user-error "Finish or cancel renaming first"))
+  (when-let* ((choice (neo-diredy--read-choice "Bookmarks" (neo-diredy--bookmark-choices)))
+              (path (bookmark-get-filename (cdr choice))))
+    (neo-diredy--check-open-file path)
+    (unless (file-directory-p path) (user-error "Bookmark is no longer a directory: %s" path))
+    (dired path)))
+
+;;;###autoload
+(defun neo-diredy-bookmark-delete ()
+  "Choose and delete one neo-diredy bookmark in a child frame."
+  (interactive)
+  (when-let* ((choice (neo-diredy--read-choice "Delete bookmark" (neo-diredy--bookmark-choices))))
+    (bookmark-delete (cdr choice))
+    (message "Bookmark deleted: %s" (cdr choice))))
+
 (defun neo-diredy--append-name (count)
   "Start a WDired session and append after point COUNT times with Evil."
   (interactive "p")
@@ -238,15 +458,108 @@ Advising its layout function does not load or require the optional package.")
     (dired-toggle-read-only))
   (evil-append count))
 
+;;;###autoload
+(defun neo-diredy-preview-scroll-up (&optional lines)
+  "Scroll the preview forward LINES lines, defaulting to five."
+  (interactive "P")
+  (unless (and neo-diredy--layout-mode (window-live-p neo-diredy--right))
+    (user-error "No active neo-diredy preview"))
+  (neo-diredy--refresh)
+  (with-selected-window neo-diredy--right
+    (condition-case nil (scroll-up (if lines (prefix-numeric-value lines) 5))
+      (beginning-of-buffer
+       (goto-char (point-min)) (set-window-start nil (point-min)))
+      (end-of-buffer nil))))
+
+;;;###autoload
+(defun neo-diredy-preview-scroll-down (&optional lines)
+  "Scroll the preview backward LINES lines, defaulting to five."
+  (interactive "P")
+  (neo-diredy-preview-scroll-up (- (if lines (prefix-numeric-value lines) 5))))
+
+(defun neo-diredy-preview-close ()
+  "Close an expanded preview and return to its directory."
+  (interactive)
+  (let ((origin neo-diredy--preview-origin))
+    (quit-window t)
+    (when (and (eq (current-buffer) origin) (derived-mode-p 'dired-mode)
+               (>= (window-total-width) 72))
+      (neo-diredy--layout-mode 1))))
+
+(define-derived-mode neo-diredy-preview-mode special-mode "Neo Preview"
+  "Read-only snapshot of a neo-diredy preview."
+  (setq-local truncate-lines nil))
+(dolist (key '("q" "<escape>" "C-c p"))
+  (define-key neo-diredy-preview-mode-map (kbd key) #'neo-diredy-preview-close))
+
+;;;###autoload
+(defun neo-diredy-preview-expand ()
+  "Show the current preview in the full window without visiting its file."
+  (interactive)
+  (unless (and neo-diredy--layout-mode (neo-diredy--layout-intact-p))
+    (user-error "No active neo-diredy preview"))
+  (when (neo-diredy--editing-p) (user-error "Finish or cancel renaming first"))
+  (neo-diredy--refresh)
+  (when (process-live-p neo-diredy--art-process) (user-error "Preview is still loading"))
+  (let ((source (window-buffer neo-diredy--center))
+        (preview neo-diredy--preview)
+        (header (neo-diredy--preview-header))
+        (buffer (generate-new-buffer " *neo-diredy-expanded-preview*")) shown)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (delay-mode-hooks (neo-diredy-preview-mode))
+            (let ((inhibit-read-only t)) (insert-buffer-substring preview))
+            (setq-local neo-diredy--preview-origin source
+                        default-directory (buffer-local-value 'default-directory source)
+                        header-line-format header)
+            (goto-char (point-min))
+            (set-buffer-modified-p nil))
+          (select-window neo-diredy--center)
+          (neo-diredy--layout-mode -1)
+          (pop-to-buffer buffer '(display-buffer-same-window))
+          (let ((image (get-text-property (point-min) 'display)))
+            (when (eq (car-safe image) 'image)
+              (setq image (copy-tree image))
+              (setf (image-property image :max-width) (window-body-width nil t)
+                    (image-property image :max-height) (window-body-height nil t))
+              (let ((inhibit-read-only t))
+                (put-text-property (point-min) (1+ (point-min)) 'display image)
+                (set-buffer-modified-p nil))))
+          (setq shown t))
+      (unless shown (kill-buffer buffer)))))
+
 (define-minor-mode neo-diredy--edit-keys-mode
-  "Use Evil editing entry keys in buffers owned by the active layout."
-  :keymap (make-sparse-keymap)
+  "Use opener and editing entry keys in buffers owned by the active layout."
+  :keymap (let ((map (make-sparse-keymap)))
+            (define-key map (kbd "<S-return>") #'neo-diredy-open)
+            (define-key map (kbd "<S-kp-enter>") #'neo-diredy-open)
+            (define-key map (kbd "C-c b a") #'neo-diredy-bookmark-add)
+            (define-key map (kbd "C-c b j") #'neo-diredy-bookmark-jump)
+            (define-key map (kbd "C-c b d") #'neo-diredy-bookmark-delete)
+            (define-key map (kbd "M-<down>") #'neo-diredy-preview-scroll-up)
+            (define-key map (kbd "M-<up>") #'neo-diredy-preview-scroll-down)
+            (define-key map (kbd "C-c p") #'neo-diredy-preview-expand)
+            map)
   (when (fboundp 'evil-normalize-keymaps)
     (evil-normalize-keymaps)))
 
 (with-eval-after-load 'evil
   (when (boundp 'neo-diredy--edit-keys-mode-map)
-    (evil-define-key* 'normal neo-diredy--edit-keys-mode-map "a" #'neo-diredy--append-name)))
+    (evil-define-key* 'normal neo-diredy--edit-keys-mode-map "a" #'neo-diredy--append-name)
+    (evil-define-key* '(normal visual motion) neo-diredy--edit-keys-mode-map
+                      (kbd "<S-return>") #'neo-diredy-open
+                      (kbd "<S-kp-enter>") #'neo-diredy-open
+                      (kbd "C-c b a") #'neo-diredy-bookmark-add
+                      (kbd "C-c b j") #'neo-diredy-bookmark-jump
+                      (kbd "C-c b d") #'neo-diredy-bookmark-delete
+                      (kbd "M-<down>") #'neo-diredy-preview-scroll-up
+                      (kbd "M-<up>") #'neo-diredy-preview-scroll-down
+                      (kbd "C-c p") #'neo-diredy-preview-expand)
+    (evil-define-key* '(normal motion) neo-diredy-preview-mode-map
+                      "q" #'neo-diredy-preview-close
+                      (kbd "<escape>") #'neo-diredy-preview-close
+                      (kbd "C-c p") #'neo-diredy-preview-close)))
 
 (defun neo-diredy--style ()
   "Temporarily style the current Dired buffer, saving its original state."
@@ -1110,9 +1423,16 @@ Keep these volatile fields out of the file-content cache."
                     (window-body-height neo-diredy--right t)
                     neo-diredy-preview-bytes neo-diredy-image-bytes)))
     (unless (equal key neo-diredy--preview-key)
-      (neo-diredy--art-cancel)
-      (setq neo-diredy--preview-key key)
-      (neo-diredy--insert-preview file attributes))))
+      (let ((same-content (and (equal (seq-take key 5) (seq-take neo-diredy--preview-key 5))
+                               (equal (nthcdr 7 key) (nthcdr 7 neo-diredy--preview-key))))
+            (start (window-start neo-diredy--right))
+            (position (window-point neo-diredy--right)))
+        (neo-diredy--art-cancel)
+        (setq neo-diredy--preview-key key)
+        (neo-diredy--insert-preview file attributes)
+        (when same-content
+          (set-window-start neo-diredy--right start)
+          (set-window-point neo-diredy--right position))))))
 
 (defconst neo-diredy--preview-modes
   '(("Emacs Lisp" emacs-lisp-mode lisp-mode)
@@ -1378,8 +1698,25 @@ stay plain."
         (mapcar (lambda (window) (cons window (window-buffer window)))
                 (window-list nil 'no-minibuffer))))
 
+(defun neo-diredy--cleanup-dired-buffers ()
+  "Dispose of unused directories created during the active layout."
+  (dolist (entry neo-diredy--buffers)
+    (let ((buffer (car entry)))
+      (when (and (buffer-live-p buffer)
+                 (not (memq buffer neo-diredy--existing-buffers))
+                 (not (eq buffer (car neo-diredy--decorated)))
+                 (not (tab-bar-get-buffer-tab buffer t))
+                 (with-current-buffer buffer
+                   (and (derived-mode-p 'dired-mode)
+                        (not (derived-mode-p 'wdired-mode))
+                        (not (buffer-modified-p))
+                        (not (save-excursion
+                               (goto-char (point-min))
+                               (re-search-forward "^[^ \n\r]" nil t))))))
+        (kill-buffer buffer)))))
+
 (defun neo-diredy--stop ()
-  "Restore saved presentation and dispose only of owned preview buffers."
+  "Restore saved presentation and dispose of unused buffers owned by the layout."
   (unless (neo-diredy--layout-intact-p)
     (setq neo-diredy--configuration nil)
     (when (assq (window-buffer) neo-diredy--buffers)
@@ -1459,7 +1796,8 @@ stay plain."
   (dolist (entry neo-diredy--buffers)
     (when (and (caddr entry) (buffer-live-p (car entry)))
       (with-current-buffer (car entry) (dired-preview-mode 1))))
-  (setq neo-diredy--buffers nil neo-diredy--overlays nil
+  (neo-diredy--cleanup-dired-buffers)
+  (setq neo-diredy--buffers nil neo-diredy--existing-buffers nil neo-diredy--overlays nil
         neo-diredy--selected-icon nil
         neo-diredy--windows nil neo-diredy--center nil
         neo-diredy--left nil neo-diredy--right nil neo-diredy--margins nil
@@ -1489,6 +1827,7 @@ All ordinary Dired operations remain available."
           (when (< (window-total-width) 72) (user-error "The Dired window needs at least 72 columns"))
           (progn
             (setq neo-diredy--handoff nil
+                  neo-diredy--existing-buffers (buffer-list)
                   neo-diredy--configuration (current-window-configuration)
                   neo-diredy--center (selected-window)
                   neo-diredy--modeline-parameter (window-parameter nil 'mode-line-format)
@@ -1574,6 +1913,10 @@ Disable to restore normal Dired.  Narrow and remote windows are left alone."
     (dolist (command '(dired dired-other-window dired-other-frame))
       (advice-remove command #'neo-diredy--auto-enable))
     (neo-diredy--layout-mode -1)
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (derived-mode-p 'neo-diredy-preview-mode)
+          (setq neo-diredy--preview-origin nil))))
     (setq neo-diredy--handoff nil)))
 
 (defun neo-diredy-unload-function ()
