@@ -57,6 +57,29 @@ https://github.com/siroio/neo-diredy
 - 配色は現在のテーマを継承します。選択行は `neo-diredy-selection` faceで調整できます。
 - modelineは設定済みの `mode-line-format` を変更せず、3ペイン全体の下部左端から表示します。行・桁、メジャーモード、文字コード、画像など、通常の表示をそのまま使います。modelineは同じDiredバッファを表示する専用ウィンドウに置き、中央のカーソル位置と同期します。`%p` などウィンドウの表示範囲に依存する項目は、下部ウィンドウを基準に計算されます。
 
+## ファイル操作
+
+`C-c f` で操作メニューを開きます。**通常の `*` マークがあれば全項目、なければカーソル位置の1項目**が対象です。折り畳んだサブディレクトリのマークも含みます。`D` は一括操作の選択に含めません。
+
+| メニュー内のキー | 操作 |
+| --- | --- |
+| `c` / `x` / `v` | コピー / 切り取り / 現在のディレクトリへ貼り付け |
+| `r` | Explorerで対象を選択（Reveal） |
+| `d` | ごみ箱へ移動、または削除。対象一覧を確認して実行 |
+| `m` / `a` / `u` | マーク切替 / 全選択 / マーク解除 |
+| `?` / `!` | 対象一覧 / 直前の操作結果 |
+| `q` | コピー・切り取りの待機を解除 |
+
+メニューは上下キーでも選べます。Enterで実行、Esc・`C-g`で取り消します。従来のDired・Evilのキーは維持します。GUI版のローカルDiredで使用でき、WDiredで名前変更中は確定・取消後に操作します。
+
+通常のヘッダーはパスだけです。マーク時に `*3`、コピー・切り取り待機中に `Copy 3` / `Cut 3` を加えます。マークした行は色を付け、切り取り待機の項目は `↪` で表示します。対象の詳しい一覧は必要なときだけ `?` で開けます。
+
+コピー・切り取りはEmacs内で共有し、ディレクトリやタブを移動して貼り付けられます。Explorerのクリップボードとは連携しません。切り取り時点では移動せず、貼り付けに成功した項目だけ待機から外します。失敗・スキップ・中断した項目は残ります。コピーは繰り返し貼り付けられ、Emacs終了時に待機を破棄します。
+
+同名がある場合はスキップ・別名・通常ファイル同士の上書きを選びます。Enterはスキップ、フォルダーの自動マージは行いません。「すべて上書き」でも、今回の処理ですでに出力した名前に重なる場合は改めて確認します。親フォルダーとその中身を選んだ場合、コピー・移動・削除では親を1回処理します。削除方法は `delete-by-moving-to-trash` に従い、ごみ箱への移動に失敗しても完全削除へ切り替えません。処理は同期実行のため、大きいフォルダーでは待ち時間があります。中断・失敗時の部分的な出力は操作結果から確認してください。
+
+RevealはWindows PowerShellとUnicode対応のShell APIを使います。日本語や絵文字を含む名前に対応し、同じ親フォルダーの対象をまとめて選択します。複数の親にまたがる場合はメニューにフォルダー数を示します。フォルダー自身も親の中で選択します。
+
 ## 開くアプリを選ぶ
 
 GUI版Emacsでは、中央の項目で `Shift+Enter`（テンキーも対応）を押すと、
@@ -226,6 +249,8 @@ emacs -Q --batch -l tests/neo-diredy-treesit-tests.el -f ert-run-tests-batch-and
 emacs -Q --batch -l tests/neo-diredy-navigation-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-open-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-workflow-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-actions-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-reveal-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/check-package.el
 emacs -Q --batch -l benchmarks/run.el
 ```

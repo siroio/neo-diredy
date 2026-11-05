@@ -134,10 +134,12 @@ Advising its layout function does not load or require the optional package.")
                        display-line-numbers hl-line-face hl-line-range-function
                        dired-hide-details-mode hl-line-mode))
 
-(defun neo-diredy--icon (_file directory)
+(defun neo-diredy--icon (file directory)
   "Return a simple label for a file of type DIRECTORY."
-  (propertize (if directory "▸ " "· ")
-              'face (if directory 'dired-directory 'shadow)))
+  (let ((cut (and (derived-mode-p 'dired-mode) (eq (car neo-diredy--clipboard) 'cut)
+                  (member file (cdr neo-diredy--clipboard)))))
+    (propertize (cond (cut "↪ ") (directory "▸ ") (t "· "))
+                'face (cond (cut 'warning) (directory 'dired-directory) (t 'shadow)))))
 
 (defun neo-diredy--row-overlay ()
   "Return the visible file anchor on the current line, if any."
@@ -210,8 +212,11 @@ Advising its layout function does not load or require the optional package.")
     (dolist (overlay (delete-dups (list neo-diredy--selected-icon selected)))
       (when (and (overlayp overlay) (overlay-buffer overlay))
         (let* ((text (copy-sequence (overlay-get overlay 'before-string)))
-               (face (if (overlay-get overlay 'neo-diredy-directory)
-                         'dired-directory 'shadow)))
+               (face (cond ((and (eq (car neo-diredy--clipboard) 'cut)
+                                 (member (overlay-get overlay 'neo-diredy-file)
+                                         (cdr neo-diredy--clipboard))) 'warning)
+                           ((overlay-get overlay 'neo-diredy-directory) 'dired-directory)
+                           (t 'shadow))))
           ;; The right-margin display precedes the two-character icon.
           (put-text-property (- (length text) 2) (length text) 'face
                              (if (eq overlay selected)
@@ -323,8 +328,10 @@ Advising its layout function does not load or require the optional package.")
     (error (user-error "Could not open %s: %s" (file-name-nondirectory file)
                        (error-message-string err)))))
 
-(defun neo-diredy--read-choice (title choices)
-  "Select one of CHOICES under TITLE in a child frame, or return nil."
+(defun neo-diredy--read-choice (title choices &optional options)
+  "Select one of CHOICES under TITLE in a child frame, or return nil.
+OPTIONS may contain :keys (character . value), :disabled (value . reason)
+and :footer.  Without OPTIONS the existing opener behavior is unchanged."
   (unless (display-graphic-p) (user-error "This menu requires a graphical frame"))
   (unless choices (user-error "No choices available"))
   (let* ((parent (selected-frame))
@@ -333,6 +340,7 @@ Advising its layout function does not load or require the optional package.")
                                                         (string-width (car choice))) choices))))))
          (height (min (max 5 (- (frame-height parent) 6)) (+ 4 (length choices))))
          (buffer (generate-new-buffer " *neo-diredy-choices*"))
+         (keys (plist-get options :keys)) (disabled (plist-get options :disabled))
          (index 0) popup)
     (unwind-protect
         (progn
@@ -376,21 +384,31 @@ Advising its layout function does not load or require the optional package.")
                                             (if (= row index) (car choice)
                                               (truncate-string-to-width (car choice) (- width 2) nil nil t))
                                             "\n")
-                                    'face (if (= row index) 'highlight 'default))))
-                  (insert (propertize "\n↑↓/j k: select   Enter: confirm   Esc: cancel" 'face 'shadow))
+                                    'face (cond ((assoc (cdr choice) disabled) 'shadow)
+                                                ((= row index) 'highlight) (t 'default)))))
+                  (insert (propertize
+                           (concat "\n" (or (cdr (assoc (cdr (nth index choices)) disabled))
+                                            (plist-get options :footer)
+                                            "↑↓/j k: select   Enter: confirm   Esc: cancel"))
+                           'face 'shadow))
                   (goto-char (point-min))
                   (forward-line (+ 2 index))
                   (set-window-point (frame-root-window popup) (point))))
               (unless (frame-visible-p popup) (make-frame-visible popup))
               (redisplay t)
-              (let ((event (read-key nil t)))
-                (pcase event
+              (let* ((event (read-key nil t)) (shortcut (assq event keys)))
+                (if shortcut
+                    (let ((choice (rassq (cdr shortcut) choices)))
+                      (unless (assoc (cdr shortcut) disabled) (throw 'chosen choice)))
+                  (pcase event
                   ((or 'down ?j ?\C-n) (setq index (mod (1+ index) (length choices))))
                   ((or 'up ?k ?\C-p) (setq index (mod (1- index) (length choices))))
-                  ((or 'return 'kp-enter ?\r) (throw 'chosen (nth index choices)))
+                  ((or 'return 'kp-enter ?\r)
+                   (unless (assoc (cdr (nth index choices)) disabled)
+                     (throw 'chosen (nth index choices))))
                   ((or 'escape ?\e ?\C-g) (throw 'chosen nil))
                   (_ (when (or (mouse-event-p event) (eq (car-safe event) 'switch-frame))
-                       (throw 'chosen nil))))))))
+                       (throw 'chosen nil)))))))))
       (when (frame-live-p popup) (delete-frame popup t))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
@@ -413,6 +431,8 @@ Advising its layout function does not load or require the optional package.")
 
 (defvar neo-diredy--action-results nil "Last (source status destination detail) results.")
 (defvar-local neo-diredy--mark-cache nil)
+(defvar neo-diredy--action-paint-key nil)
+(defvar neo-diredy--action-overlays nil)
 
 (defun neo-diredy--action-check ()
   "Require an ordinary local Dired buffer for file actions."
@@ -648,6 +668,105 @@ OVERWRITE permits replacing a regular file.  Return a symbol or a new path."
       (neo-diredy--action-refresh files)
       (neo-diredy--action-report (if trash "Trash" "Delete") (nreverse results)))))
 
+(defun neo-diredy--action-status ()
+  "Return only active selection/clipboard state; keep the idle view quiet."
+  (string-join
+   (delq nil (list (when-let* ((marks (and (derived-mode-p 'dired-mode)
+                                          (not (derived-mode-p 'wdired-mode))
+                                          (neo-diredy--action-marks))))
+                    (format "*%d" (length marks)))
+                  (when neo-diredy--clipboard
+                    (format "%s %d" (if (eq (car neo-diredy--clipboard) 'cut) "Cut" "Copy")
+                            (length (cdr neo-diredy--clipboard)))))) " · "))
+
+(defun neo-diredy--action-header ()
+  "Fit the current path and short state into the central header."
+  (let* ((state (neo-diredy--action-status))
+         (suffix (if (string-empty-p state) "" (concat "  |  " state)))
+         (width (if (window-live-p neo-diredy--center) (window-total-width neo-diredy--center) (window-width)))
+         (path (abbreviate-file-name default-directory))
+         (room (max 1 (- width 3 (string-width suffix))))
+         (skip (max 0 (- (string-width path) room))))
+    (when (> skip 0)
+      (setq path (concat "…" (truncate-string-to-width path (string-width path) (1+ skip)))))
+    (let ((text (concat "  " path suffix)))
+      (if (neo-diredy--editing-p) (propertize text 'face 'warning) text))))
+
+(defun neo-diredy--actions-paint ()
+  "Refresh pending icons and marked rows only when their state changes."
+  (let ((key (list (current-buffer) (buffer-chars-modified-tick) neo-diredy--clipboard)))
+    (unless (equal key neo-diredy--action-paint-key)
+      (setq neo-diredy--action-paint-key key)
+      (mapc #'delete-overlay neo-diredy--action-overlays)
+      (setq neo-diredy--action-overlays nil)
+      (let ((marks (neo-diredy--action-marks)))
+        (dolist (anchor neo-diredy--overlays)
+          (when-let* ((file (overlay-get anchor 'neo-diredy-file)))
+            (let ((text (overlay-get anchor 'before-string)))
+              (overlay-put anchor 'before-string
+                           (concat (substring text 0 (max 0 (- (length text) 2)))
+                                   (neo-diredy--icon file (overlay-get anchor 'neo-diredy-directory)))))
+            (when (member file marks)
+              (save-excursion
+                (goto-char (overlay-start anchor))
+                (let ((overlay (make-overlay (point) (line-end-position))))
+                  (overlay-put overlay 'face 'dired-marked)
+                  (overlay-put overlay 'priority -10)
+                  (push overlay neo-diredy--action-overlays))))))))))
+
+(defun neo-diredy-toggle-mark ()
+  "Toggle the current item's normal mark without moving point."
+  (interactive) (neo-diredy--action-check)
+  (when (dired-get-filename nil t)
+    (save-excursion
+      (if (= (char-after (line-beginning-position)) ?*) (dired-unmark 1) (dired-mark 1)))))
+
+(defun neo-diredy-mark-all ()
+  "Mark unmarked file rows, retaining existing deletion flags."
+  (interactive) (neo-diredy--action-check)
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (when (and (= (char-after) ?\s)
+                 (when-let* ((file (dired-get-filename nil t)))
+                   (not (member (file-name-nondirectory file) '("." "..")))))
+        (save-excursion (dired-mark 1)))
+      (forward-line 1))))
+
+(defun neo-diredy-unmark-all ()
+  "Clear normal marks, retaining deletion flags."
+  (interactive) (neo-diredy--action-check)
+  (save-excursion (dired-unmark-all-files ?*)))
+
+(defun neo-diredy--action-view (title lines)
+  "Display scrollable LINES under TITLE, leaving files and marks untouched."
+  (let ((buffer (get-buffer-create (format "*neo-diredy %s*" title)))
+        (directory default-directory))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer) (insert title "\n\n" (string-join lines "\n") "\n"))
+      (setq default-directory directory)
+      (special-mode)
+      (goto-char (point-min)))
+    (pop-to-buffer buffer)))
+
+(defun neo-diredy-show-targets ()
+  "Show the complete list of current action targets."
+  (interactive)
+  (let ((files (neo-diredy--action-targets)))
+    (neo-diredy--action-view (format "Targets (%d)" (length files)) files)))
+
+(defun neo-diredy-show-results ()
+  "Show the last operation's per-item outcomes."
+  (interactive)
+  (unless neo-diredy--action-results (user-error "No operation results"))
+  (neo-diredy--action-view
+   "Results" (mapcar (lambda (row)
+                       (format "%s  %s%s%s" (cadr row) (car row)
+                               (if (nth 2 row) (concat " → " (nth 2 row)) "")
+                               (if (nth 3 row) (concat "\n    " (nth 3 row)) "")))
+                     neo-diredy--action-results)))
+
 ;;; Reveal uses Unicode Shell item IDs, grouping selections by parent.
 
 (defvar neo-diredy--reveal-process nil)
@@ -807,6 +926,42 @@ foreach ($group in $groups) {
                (when (process-live-p errors) (delete-process errors))
                (neo-diredy--reveal-report groups "" (error-message-string err)))))))
 
+;;;###autoload
+(defun neo-diredy-actions ()
+  "Choose the same file action for one item or all ordinary marks."
+  (interactive) (neo-diredy--action-check)
+  (let ((files (neo-diredy--action-targets))
+        (choices `(("c  Copy" . copy) ("x  Cut" . cut)
+                   (,(if neo-diredy--clipboard
+                         (format "v  Paste (%s %d)" (car neo-diredy--clipboard) (length (cdr neo-diredy--clipboard)))
+                       "v  Paste") . paste)
+                   (,(let ((count (length (neo-diredy--reveal-groups (neo-diredy--action-targets)))))
+                       (if (> count 1) (format "r  Reveal (%d folders)" count) "r  Reveal")) . reveal)
+                   (,(if delete-by-moving-to-trash "d  Trash…" "d  Delete…") . delete)
+                   ("?  Targets" . targets) ("m  Mark / unmark" . mark)
+                   ("a  Mark all" . all) ("u  Unmark all" . unmark)
+                   ("q  Clear clipboard" . clear) ("!  Results" . results)))
+        disabled)
+    (unless files
+      (dolist (action '(copy cut reveal delete targets mark))
+        (push (cons action "No target") disabled)))
+    (unless (eq system-type 'windows-nt) (push '(reveal . "Windows only") disabled))
+    (when neo-diredy--reveal-process (push '(reveal . "Reveal running") disabled))
+    (unless neo-diredy--clipboard
+      (push '(paste . "Clipboard empty") disabled) (push '(clear . "Clipboard empty") disabled))
+    (unless neo-diredy--action-results (push '(results . "No results") disabled))
+    (when-let* ((choice (neo-diredy--read-choice
+                        (format "Actions · %d" (length files)) choices
+                        (list :keys '((?c . copy) (?x . cut) (?v . paste) (?r . reveal) (?d . delete)
+                                      (?? . targets) (?m . mark) (?a . all) (?u . unmark) (?q . clear) (?! . results))
+                              :disabled disabled :footer "↑↓ / key · Enter · Esc"))))
+      (pcase (cdr choice)
+        ('copy (neo-diredy-copy)) ('cut (neo-diredy-cut)) ('paste (neo-diredy-paste))
+        ('reveal (neo-diredy-reveal)) ('delete (neo-diredy-delete))
+        ('targets (neo-diredy-show-targets)) ('results (neo-diredy-show-results))
+        ('mark (neo-diredy-toggle-mark)) ('all (neo-diredy-mark-all))
+        ('unmark (neo-diredy-unmark-all)) ('clear (neo-diredy-clear-clipboard))))))
+
 (defun neo-diredy--bookmark-choices ()
   "Return the directory bookmarks created by neo-diredy."
   (bookmark-maybe-load-default-file)
@@ -931,6 +1086,7 @@ foreach ($group in $groups) {
 (define-minor-mode neo-diredy--edit-keys-mode
   "Use opener and editing entry keys in buffers owned by the active layout."
   :keymap (let ((map (make-sparse-keymap)))
+            (define-key map (kbd "C-c f") #'neo-diredy-actions)
             (define-key map (kbd "<S-return>") #'neo-diredy-open)
             (define-key map (kbd "<S-kp-enter>") #'neo-diredy-open)
             (define-key map (kbd "C-c b a") #'neo-diredy-bookmark-add)
@@ -947,6 +1103,7 @@ foreach ($group in $groups) {
   (when (boundp 'neo-diredy--edit-keys-mode-map)
     (evil-define-key* 'normal neo-diredy--edit-keys-mode-map "a" #'neo-diredy--append-name)
     (evil-define-key* '(normal visual motion) neo-diredy--edit-keys-mode-map
+                      (kbd "C-c f") #'neo-diredy-actions
                       (kbd "<S-return>") #'neo-diredy-open
                       (kbd "<S-kp-enter>") #'neo-diredy-open
                       (kbd "C-c b a") #'neo-diredy-bookmark-add
@@ -981,10 +1138,7 @@ foreach ($group in $groups) {
               hl-line-face 'neo-diredy-selection
               hl-line-range-function #'neo-diredy--selection-range
               header-line-format
-              '(:eval (let ((path (concat "  " (abbreviate-file-name default-directory))))
-                        (if (neo-diredy--editing-p)
-                            (propertize path 'face 'warning)
-                          path))))
+              '(:eval (neo-diredy--action-header)))
   (dired-hide-details-mode 1)
   (unless neo-diredy--modeline-face
     (setq neo-diredy--modeline-face
@@ -1031,6 +1185,7 @@ foreach ($group in $groups) {
 		(push overlay neo-diredy--overlays))))
 	  (forward-line 1))))
     (neo-diredy--metadata-paint))
+  (neo-diredy--actions-paint)
   (neo-diredy--normalize-point)
   (hl-line-mode 1)
   (hl-line-highlight)
@@ -2245,6 +2400,8 @@ stay plain."
 
 (defun neo-diredy--stop ()
   "Restore saved presentation and dispose of unused buffers owned by the layout."
+  (mapc #'delete-overlay neo-diredy--action-overlays)
+  (setq neo-diredy--action-overlays nil neo-diredy--action-paint-key nil)
   (unless (neo-diredy--layout-intact-p)
     (setq neo-diredy--configuration nil)
     (when (assq (window-buffer) neo-diredy--buffers)

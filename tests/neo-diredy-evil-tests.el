@@ -84,7 +84,8 @@
   (unwind-protect
       (neo-diredy-test--with-directory
        (evil-normal-state)
-       (let* ((bindings '(("C-c b a" . neo-diredy-bookmark-add)
+       (let* ((bindings '(("C-c f" . neo-diredy-actions)
+                          ("C-c b a" . neo-diredy-bookmark-add)
                           ("C-c b j" . neo-diredy-bookmark-jump)
                           ("C-c b d" . neo-diredy-bookmark-delete)
                           ("M-<down>" . neo-diredy-preview-scroll-up)
