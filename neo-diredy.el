@@ -1756,7 +1756,10 @@ stay plain."
                 (condition-case err
                     (neo-diredy--listing (file-name-directory (directory-file-name directory)) directory)
                   (error (insert (error-message-string err))))
-                (set-buffer-modified-p nil)))))
+                (set-buffer-modified-p nil))))
+          ;; Styling has moved the modeline to the new directory too, so
+          ;; buffers left behind by navigation can now be released safely.
+          (neo-diredy--cleanup-dired-buffers))
         (neo-diredy--metadata-refresh (neo-diredy--original-file))
         (neo-diredy--render-preview (neo-diredy--original-file))
         (force-mode-line-update)))))
@@ -1836,7 +1839,10 @@ stay plain."
                         (not (save-excursion
                                (goto-char (point-min))
                                (re-search-forward "^[^ \n\r]" nil t))))))
-        (kill-buffer buffer)))))
+        (kill-buffer buffer))))
+  (setq neo-diredy--buffers
+        (seq-filter (lambda (entry) (buffer-live-p (car entry)))
+                    neo-diredy--buffers)))
 
 (defun neo-diredy--stop ()
   "Restore saved presentation and dispose of unused buffers owned by the layout."
