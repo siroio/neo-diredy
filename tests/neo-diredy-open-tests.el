@@ -40,7 +40,7 @@
                 (lambda (&rest options) (setq captured options) 'test-process)))
        (neo-diredy--open-file path (list program "--option" "two words")))
      (should (equal (plist-get captured :command)
-                    (list program "--option" "two words" path)))
+                    (list (executable-find program) "--option" "two words" path)))
      (should (plist-get captured :noquery)))))
 
 (ert-deftest neo-diredy-open-custom-real-process-receives-one-path ()
