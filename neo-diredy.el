@@ -648,6 +648,165 @@ OVERWRITE permits replacing a regular file.  Return a symbol or a new path."
       (neo-diredy--action-refresh files)
       (neo-diredy--action-report (if trash "Trash" "Delete") (nreverse results)))))
 
+;;; Reveal uses Unicode Shell item IDs, grouping selections by parent.
+
+(defvar neo-diredy--reveal-process nil)
+(defconst neo-diredy--reveal-script
+  "$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+try {
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NeoDiredyReveal {
+  [DllImport(\"ole32.dll\")] static extern int CoInitializeEx(IntPtr p, uint flags);
+  [DllImport(\"ole32.dll\")] static extern void CoUninitialize();
+  [DllImport(\"shell32.dll\", CharSet = CharSet.Unicode)]
+  static extern int SHParseDisplayName(string name, IntPtr context, out IntPtr pidl, uint mask, out uint attributes);
+  [DllImport(\"shell32.dll\")] static extern IntPtr ILFindLastID(IntPtr pidl);
+  [DllImport(\"shell32.dll\")]
+  static extern int SHOpenFolderAndSelectItems(IntPtr folder, uint count, IntPtr[] children, uint flags);
+  public static void Show(string directory, string[] files) {
+    int init = CoInitializeEx(IntPtr.Zero, 2);
+    if (init < 0) Marshal.ThrowExceptionForHR(init);
+    IntPtr folder = IntPtr.Zero;
+    IntPtr[] full = new IntPtr[files.Length];
+    IntPtr[] children = new IntPtr[files.Length];
+    try {
+      uint attributes;
+      Marshal.ThrowExceptionForHR(SHParseDisplayName(System.IO.Path.GetFullPath(directory), IntPtr.Zero, out folder, 0, out attributes));
+      for (int i = 0; i < files.Length; i++) {
+        Marshal.ThrowExceptionForHR(SHParseDisplayName(System.IO.Path.GetFullPath(files[i]), IntPtr.Zero, out full[i], 0, out attributes));
+        children[i] = ILFindLastID(full[i]);
+      }
+      Marshal.ThrowExceptionForHR(SHOpenFolderAndSelectItems(folder, (uint)children.Length, children, 0));
+    } finally {
+      foreach (IntPtr item in full) if (item != IntPtr.Zero) Marshal.FreeCoTaskMem(item);
+      if (folder != IntPtr.Zero) Marshal.FreeCoTaskMem(folder);
+      CoUninitialize();
+    }
+  }
+}
+'@
+$groups = ConvertFrom-Json -InputObject ([Console]::In.ReadToEnd())
+$results = @()
+foreach ($group in $groups) {
+  if ($null -eq $group) { continue }
+  try {
+    [NeoDiredyReveal]::Show([string]$group.directory, [string[]]$group.files)
+    $results += @{directory=$group.directory; ok=$true}
+  } catch { $results += @{directory=$group.directory; ok=$false; error=$_.Exception.Message} }
+}
+[Console]::WriteLine((ConvertTo-Json -InputObject @($results) -Compress -Depth 5))
+} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+" "Fixed helper; filenames arrive only as UTF-8 JSON on standard input.")
+
+(defun neo-diredy--reveal-groups (files)
+  "Group FILES by parent directory while retaining their order."
+  (let (groups)
+    (dolist (file files)
+      (let* ((parent (file-name-directory (directory-file-name file)))
+             (group (cl-find parent groups :key #'car :test #'neo-diredy--action-equal)))
+        (if group (setcdr group (append (cdr group) (list file)))
+          (setq groups (append groups (list (list parent file)))))))
+    groups))
+
+(defun neo-diredy--reveal-payload (groups)
+  "Encode GROUPS as data without interpolating filenames into code."
+  (json-encode (vconcat (mapcar (lambda (group)
+                                `((directory . ,(car group)) (files . ,(vconcat (cdr group))))) groups))))
+
+(defun neo-diredy--reveal-command ()
+  "Return the fixed Windows PowerShell helper command."
+  (let ((program (and (eq system-type 'windows-nt)
+                      (expand-file-name "System32/WindowsPowerShell/v1.0/powershell.exe"
+                                        (or (getenv "SystemRoot") "C:/Windows")))))
+    (unless (and program (file-executable-p program))
+      (user-error "Reveal requires Windows PowerShell"))
+    (list program "-NoLogo" "-NoProfile" "-NonInteractive" "-STA" "-OutputFormat" "Text" "-EncodedCommand"
+          (base64-encode-string (encode-coding-string neo-diredy--reveal-script 'utf-16le) t))))
+
+(defun neo-diredy--reveal-report (groups output failure)
+  "Report each item in GROUPS using helper OUTPUT or FAILURE."
+  (let ((data (unless failure
+                (condition-case nil
+                    (json-parse-string output :object-type 'alist :array-type 'array
+                                       :null-object nil :false-object nil)
+                  (error nil)))) results)
+    (unless (vectorp data) (setq data []))
+    (dolist (group groups)
+      (let ((row (seq-find (lambda (x) (and (listp x) (cl-every #'consp x)
+                                          (equal (car group) (alist-get 'directory x)))) data)))
+        (dolist (file (cdr group))
+          (push (list file (if (and row (eq (alist-get 'ok row) t)) 'done 'failed) nil
+                      (unless (and row (eq (alist-get 'ok row) t))
+                        (or failure (alist-get 'error row) "Invalid or missing Reveal result"))) results))))
+    (neo-diredy--action-report "Reveal" (nreverse results))))
+
+(defun neo-diredy--reveal-stop ()
+  "Cancel our helper and discard its callback and temporary buffer."
+  (when-let* ((process neo-diredy--reveal-process))
+    (setq neo-diredy--reveal-process nil)
+    (when-let* ((timer (process-get process 'timer))) (cancel-timer timer))
+    (set-process-sentinel process #'ignore)
+    (when (process-live-p process) (delete-process process))
+    (when-let* ((errors (process-get process 'errors))) (delete-process errors))
+    (when (buffer-live-p (process-buffer process)) (kill-buffer (process-buffer process)))))
+
+;;;###autoload
+(defun neo-diredy-reveal ()
+  "Reveal one item or all normal marks together in Windows Explorer."
+  (interactive)
+  (let* ((files (neo-diredy--action-targets)) (groups (neo-diredy--reveal-groups files))
+         (command (neo-diredy--reveal-command))
+         ;; Windows Emacs may launch through an ANSI current-directory path.
+         ;; The helper needs no working files; pass every target via UTF-8 stdin.
+         (default-directory (file-name-directory (car command))))
+    (unless files (user-error "No files selected"))
+    (when neo-diredy--reveal-process (user-error "Reveal is already running"))
+    (let ((buffer (generate-new-buffer " *neo-diredy-reveal*"))
+          ;; PowerShell diagnostics are not protocol data; discard them without
+          ;; accumulating an unbounded stderr buffer.
+          (errors (make-pipe-process :name "neo-diredy-reveal-stderr" :noquery t
+                                     :filter #'ignore :sentinel #'ignore)))
+      (condition-case err
+          (let ((process
+                 (make-process
+                  :name "neo-diredy-reveal" :buffer buffer :stderr errors :command command
+                  :coding 'utf-8-unix :connection-type 'pipe :noquery t
+                  :filter (lambda (process text)
+                            (when (buffer-live-p (process-buffer process))
+                              (with-current-buffer (process-buffer process)
+                                (if (> (+ (buffer-size) (length text)) (* 1024 1024))
+                                    (progn (process-put process 'failure "Reveal output limit") (delete-process process))
+                                  (goto-char (point-max)) (insert text)))))
+                  :sentinel
+                  (lambda (process _event)
+                    (when (and (eq process neo-diredy--reveal-process)
+                               (memq (process-status process) '(exit signal)))
+                      (let ((output (with-current-buffer buffer (buffer-string)))
+                            (failure (or (process-get process 'failure)
+                                         (unless (zerop (process-exit-status process)) "Reveal helper failed"))))
+                        (neo-diredy--reveal-stop)
+                        (neo-diredy--reveal-report groups output failure)))))))
+            (setq neo-diredy--reveal-process process)
+            (process-put process 'errors errors)
+            (process-put process 'timer
+                         (run-at-time 30 nil
+                                      (lambda ()
+                                        (when (eq process neo-diredy--reveal-process)
+                                          (process-put process 'failure "Reveal timed out")
+                                          (delete-process process)))))
+            (process-send-string process (neo-diredy--reveal-payload groups))
+            (process-send-eof process)
+            (message "Reveal %d" (length files)))
+        (error (neo-diredy--reveal-stop)
+               (when (buffer-live-p buffer) (kill-buffer buffer))
+               (when (process-live-p errors) (delete-process errors))
+               (neo-diredy--reveal-report groups "" (error-message-string err)))))))
+
 (defun neo-diredy--bookmark-choices ()
   "Return the directory bookmarks created by neo-diredy."
   (bookmark-maybe-load-default-file)
@@ -2291,6 +2450,7 @@ Disable to restore normal Dired.  Narrow and remote windows are left alone."
 (defun neo-diredy-unload-function ()
   "Remove active hooks, advice and windows before unloading the package."
   (neo-diredy-mode -1)
+  (neo-diredy--reveal-stop)
   (setq neo-diredy--clipboard nil neo-diredy--action-results nil)
   nil)
 
