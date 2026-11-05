@@ -51,6 +51,7 @@
 (defvar compilation-error-regexp-alist)
 (defvar compilation-error-regexp-alist-alist)
 (defvar w32-quote-process-args)
+(defvar neo-diredy--clipboard nil "Session clipboard: (copy-or-cut . absolute-paths).")
 
 (defgroup neo-diredy nil "Three-column Dired view." :group 'dired)
 (defcustom neo-diredy-preview-bytes (* 64 1024)
@@ -407,6 +408,245 @@ Advising its layout function does not load or require the optional package.")
                         (concat "Open: " (file-name-nondirectory (directory-file-name file)))
                         (neo-diredy--open-choices file))))
       (neo-diredy--open-file file (cdr choice)))))
+
+;;; Single and marked file actions
+
+(defvar neo-diredy--action-results nil "Last (source status destination detail) results.")
+(defvar-local neo-diredy--mark-cache nil)
+
+(defun neo-diredy--action-check ()
+  "Require an ordinary local Dired buffer for file actions."
+  (unless (and (derived-mode-p 'dired-mode) (not (derived-mode-p 'wdired-mode)))
+    (user-error "Finish renaming before using file actions"))
+  (when (file-remote-p default-directory) (user-error "File actions require a local directory")))
+
+(defun neo-diredy--action-marks ()
+  "Return ordinary marks, cached until the listing changes."
+  (let ((tick (buffer-chars-modified-tick)))
+    (unless (equal tick (car neo-diredy--mark-cache))
+      (setq neo-diredy--mark-cache
+            (cons tick (let ((dired-marker-char ?*) (transient-mark-mode nil))
+                         (dired-get-marked-files nil 'marked)))))
+    (cdr neo-diredy--mark-cache)))
+
+(defun neo-diredy--action-path (file)
+  "Resolve FILE's parent while retaining the final symlink itself."
+  (let* ((path (directory-file-name (expand-file-name file)))
+         (parent (file-name-directory path)))
+    (expand-file-name (file-name-nondirectory path) (file-truename parent))))
+
+(defun neo-diredy--action-equal (a b)
+  "Compare normalized paths A and B with the platform's case rules."
+  (string-equal (if (eq system-type 'windows-nt) (downcase a) a)
+                (if (eq system-type 'windows-nt) (downcase b) b)))
+
+(defun neo-diredy--action-within (file directory)
+  "Whether FILE is strictly inside DIRECTORY after resolving parents."
+  (string-prefix-p (file-name-as-directory (neo-diredy--action-path directory))
+                   (neo-diredy--action-path file) (eq system-type 'windows-nt)))
+
+(defun neo-diredy--action-targets (&optional collapse)
+  "Return normal marks or the current item; COLLAPSE covered descendants."
+  (neo-diredy--action-check)
+  (let* ((files (or (neo-diredy--action-marks)
+                    (when-let* ((file (dired-get-filename nil t))) (list file))))
+         (files (delete-dups
+                 (mapcar #'directory-file-name
+                         (seq-remove (lambda (f) (member (file-name-nondirectory f) '("." ".."))) files)))))
+    (when collapse
+      (setq files
+            (seq-remove
+             (lambda (file)
+               (cl-some (lambda (parent)
+                          (and (not (equal file parent)) (file-directory-p parent)
+                               (not (file-symlink-p parent))
+                               (neo-diredy--action-within file parent))) files)) files)))
+    files))
+
+(defun neo-diredy--action-exists (file)
+  "Include dangling symlinks when checking FILE."
+  (or (file-exists-p file) (file-symlink-p file)))
+
+(defun neo-diredy--action-store (kind)
+  "Capture current action targets as KIND without modifying files."
+  (let ((files (neo-diredy--action-targets t)))
+    (unless files (user-error "No files selected"))
+    (setq neo-diredy--clipboard (cons kind (copy-sequence files)))
+    (force-mode-line-update t)
+    (message "%s %d" (if (eq kind 'cut) "Cut" "Copy") (length files))))
+
+;;;###autoload
+(defun neo-diredy-copy ()
+  "Keep marked files, or the current item, ready to copy."
+  (interactive) (neo-diredy--action-store 'copy))
+
+;;;###autoload
+(defun neo-diredy-cut ()
+  "Keep marked files, or the current item, ready to move on paste."
+  (interactive) (neo-diredy--action-store 'cut))
+
+(defun neo-diredy-clear-clipboard ()
+  "Forget pending copies or moves without changing any files."
+  (interactive)
+  (setq neo-diredy--clipboard nil)
+  (force-mode-line-update t)
+  (message "Clipboard cleared"))
+
+(defun neo-diredy--action-conflict (source destination overwrite)
+  "Choose a conflict action for SOURCE and DESTINATION.
+OVERWRITE permits replacing a regular file.  Return a symbol or a new path."
+  (let ((answer (read-char-choice
+                 (format "%s exists: [s]kip [n]ame %s[q]uit "
+                         (file-name-nondirectory destination)
+                         (if overwrite "[o]verwrite [S]kip all [O]verwrite all " ""))
+                 (if overwrite '(?s ?n ?o ?S ?O ?q ?\r) '(?s ?n ?q ?\r)))))
+    (pcase answer
+      (?n (expand-file-name (read-string "New name: " (file-name-nondirectory source))
+                            (file-name-directory destination)))
+      (?o 'overwrite) (?O 'overwrite-all) (?S 'skip-all) (?q (signal 'quit nil))
+      (_ 'skip))))
+
+(defun neo-diredy--action-destination-check (source destination)
+  "Reject self-copies and putting SOURCE inside itself at DESTINATION."
+  (when (or (neo-diredy--action-equal (neo-diredy--action-path source)
+                                     (neo-diredy--action-path destination))
+            (and (file-exists-p destination) (file-equal-p source destination)))
+    (user-error "Source and destination are the same"))
+  (when (and (file-directory-p source) (not (file-symlink-p source))
+             (or (neo-diredy--action-within destination source)
+                 (file-in-directory-p destination source)))
+    (user-error "Cannot put a directory inside itself")))
+
+(defun neo-diredy--action-refresh (paths)
+  "Refresh existing Dired listings affected by PATHS, retaining their marks."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'dired-mode) (not (derived-mode-p 'wdired-mode))
+                 (not (file-remote-p default-directory)) (file-directory-p default-directory)
+                 (cl-some (lambda (path)
+                            (assoc (file-name-as-directory (file-name-directory path))
+                                   dired-subdir-alist)) paths))
+        (condition-case err (revert-buffer nil t)
+          (error (message "Could not refresh %s: %s" (buffer-name) (error-message-string err)))))))
+  (force-mode-line-update t))
+
+(defun neo-diredy--action-report (verb results)
+  "Store RESULTS and summarize VERB without opening another window."
+  (setq neo-diredy--action-results results)
+  (let ((done (cl-count 'done results :key #'cadr))
+        (failed (cl-count 'failed results :key #'cadr))
+        (skipped (cl-count 'skipped results :key #'cadr))
+        (pending (cl-count 'pending results :key #'cadr)))
+    (message "%s: %d done%s%s%s" verb done
+             (if (> skipped 0) (format ", %d skipped" skipped) "")
+             (if (> failed 0) (format ", %d failed" failed) "")
+             (if (> pending 0) (format ", %d pending" pending) ""))))
+
+;;;###autoload
+(defun neo-diredy-paste ()
+  "Copy or move the internal clipboard into the displayed directory."
+  (interactive)
+  (neo-diredy--action-check)
+  (unless neo-diredy--clipboard (user-error "Clipboard is empty"))
+  (require 'dired-aux)
+  (let* ((clipboard neo-diredy--clipboard) (kind (car clipboard))
+         (directory default-directory) (remaining (copy-sequence (cdr clipboard)))
+         (dired-copy-dereference nil) (dired-recursive-copies 'always)
+         (dired-overwrite-confirmed nil) (overwrite-backup-query nil)
+         results changed claimed all stopped)
+    (dolist (source (cdr clipboard))
+      (let ((destination (expand-file-name (file-name-nondirectory source) directory))
+            (status 'pending) detail overwrite)
+        (if stopped (setq detail "Not processed after interruption")
+          (condition-case err
+              (progn
+                (unless (neo-diredy--action-exists source) (error "Source no longer exists"))
+                (when (file-remote-p source) (user-error "Remote source"))
+                (neo-diredy--action-destination-check source destination)
+                (while (and (neo-diredy--action-exists destination) (not overwrite)
+                            (not (eq status 'skipped)))
+                  (let* ((regular (and (file-regular-p source) (not (file-symlink-p source))
+                                       (file-regular-p destination) (not (file-symlink-p destination))))
+                         ;; Overwrite-all never authorizes erasing output from
+                         ;; another source in this same paste operation.
+                         (choice (or (and regular all
+                                          (or (eq all 'skip)
+                                              (not (cl-member (neo-diredy--action-path destination) claimed
+                                                              :test #'neo-diredy--action-equal))) all)
+                                     (neo-diredy--action-conflict source destination regular))))
+                    (pcase choice
+                      ((or 'overwrite 'overwrite-all)
+                       (unless regular (error "Only regular files may be overwritten"))
+                       (setq overwrite t)
+                       (when (eq choice 'overwrite-all) (setq all 'overwrite)))
+                      ((or 'skip 'skip-all)
+                       (setq status 'skipped detail "Destination exists")
+                       (when (eq choice 'skip-all) (setq all 'skip)))
+                      ((pred stringp)
+                       (unless (and (not (file-remote-p choice))
+                                    (neo-diredy--action-equal
+                                     (file-truename (file-name-directory choice))
+                                     (file-truename directory)))
+                         (user-error "Choose a name in the current destination directory"))
+                       (setq destination choice)
+                       (neo-diredy--action-destination-check source destination))
+                      (_ (signal 'quit nil)))))
+                (unless (eq status 'skipped)
+                  (push (neo-diredy--action-path destination) claimed)
+                  (message "%s %d/%d: %s" (if (eq kind 'cut) "Move" "Copy")
+                           (1+ (length results)) (length (cdr clipboard)) (file-name-nondirectory source))
+                  (let ((dired-overwrite-confirmed overwrite))
+                    (if (eq kind 'cut)
+                        (dired-rename-file source destination overwrite)
+                      (dired-copy-file source destination overwrite)))
+                  (unless (and (neo-diredy--action-exists destination)
+                               (or (eq kind 'copy) (not (neo-diredy--action-exists source))))
+                    (error "Operation did not finish"))
+                  (setq status 'done remaining (delete source remaining))))
+            (quit (setq stopped t detail "Interrupted; check the destination for partial data"))
+            (error (setq status 'failed detail (concat (error-message-string err)
+                                                       "; check the destination for partial data")))))
+        (push (list source status destination detail) results)
+        (push source changed) (push destination changed)))
+    (when (and (eq kind 'cut) (eq clipboard neo-diredy--clipboard))
+      (setq neo-diredy--clipboard (when remaining (cons 'cut remaining))))
+    (neo-diredy--action-refresh changed)
+    (neo-diredy--action-report (if (eq kind 'cut) "Move" "Copy") (nreverse results))))
+
+(defun neo-diredy--confirm-delete (files trash)
+  "Show all FILES and confirm the actual deletion mode TRASH."
+  (let ((buffer (generate-new-buffer " *neo-diredy-delete*")))
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer buffer
+            (insert (if trash "Move to trash\n\n" "Permanently delete\n\n"))
+            (dolist (file files) (insert file (if (file-directory-p file) "  (including contents)" "") "\n"))
+            (special-mode))
+          (display-buffer buffer)
+          (yes-or-no-p (format "%s %d item(s)? " (if trash "Trash" "Permanently delete") (length files))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+;;;###autoload
+(defun neo-diredy-delete ()
+  "Confirm and delete marked files, or the current item."
+  (interactive)
+  (let ((files (neo-diredy--action-targets t)) (trash delete-by-moving-to-trash) results stopped)
+    (unless files (user-error "No files selected"))
+    (when (neo-diredy--confirm-delete files trash)
+      (dolist (file files)
+        (let ((status 'pending) detail)
+          (if stopped (setq detail "Not processed after interruption")
+            (condition-case err
+                (progn
+                  (unless (neo-diredy--action-exists file) (error "File no longer exists"))
+                  ;; Call trash directly: never fall back to permanent deletion.
+                  (if trash (move-file-to-trash file) (dired-delete-file file 'always nil))
+                  (setq status 'done))
+              (quit (setq stopped t detail "Interrupted"))
+              (error (setq status 'failed detail (error-message-string err)))))
+          (push (list file status nil detail) results)))
+      (neo-diredy--action-refresh files)
+      (neo-diredy--action-report (if trash "Trash" "Delete") (nreverse results)))))
 
 (defun neo-diredy--bookmark-choices ()
   "Return the directory bookmarks created by neo-diredy."
@@ -2051,6 +2291,7 @@ Disable to restore normal Dired.  Narrow and remote windows are left alone."
 (defun neo-diredy-unload-function ()
   "Remove active hooks, advice and windows before unloading the package."
   (neo-diredy-mode -1)
+  (setq neo-diredy--clipboard nil neo-diredy--action-results nil)
   nil)
 
 ;;; Asynchronous art extraction
