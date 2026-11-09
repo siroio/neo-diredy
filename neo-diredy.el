@@ -328,17 +328,43 @@ Advising its layout function does not load or require the optional package.")
     (error (user-error "Could not open %s: %s" (file-name-nondirectory file)
                        (error-message-string err)))))
 
+(defun neo-diredy--choice-anchor (window)
+  "Return (X Y HEIGHT) for the selected row in WINDOW, in frame pixels."
+  (redisplay t)
+  (with-current-buffer (window-buffer window)
+    (save-excursion
+      (goto-char (window-point window))
+      (when (derived-mode-p 'dired-mode) (dired-move-to-filename))
+      (let* ((edges (window-inside-pixel-edges window))
+             (position (pos-visible-in-window-p (point) window t))
+             (glyph (posn-at-point (point) window)))
+        (list (+ (car edges) (max 0 (or (car position) 0)))
+              ;; Y already includes header/tab lines; X starts at the body.
+              (+ (cadr (window-pixel-edges window))
+                 (or (cadr position) (- (cadr edges) (cadr (window-pixel-edges window)))))
+              (max (frame-char-height (window-frame window))
+                   (or (cdr (posn-object-width-height glyph)) 0)))))))
+
 (defun neo-diredy--read-choice (title choices &optional options)
   "Select one of CHOICES under TITLE in a child frame, or return nil.
 OPTIONS may contain :keys (character . value), :disabled (value . reason)
-and :footer.  Without OPTIONS the existing opener behavior is unchanged."
+and :footer.  Place the menu below the selected row, or above if needed."
   (unless (display-graphic-p) (user-error "This menu requires a graphical frame"))
   (unless choices (user-error "No choices available"))
   (let* ((parent (selected-frame))
-         (width (min (- (frame-width parent) 4)
-                     (max 44 (+ 4 (apply #'max (mapcar (lambda (choice)
-                                                        (string-width (car choice))) choices))))))
-         (height (min (max 5 (- (frame-height parent) 6)) (+ 4 (length choices))))
+         (origin (selected-window))
+         (anchor (neo-diredy--choice-anchor origin))
+         (edges (window-inside-pixel-edges origin))
+         (below (+ (cadr anchor) (nth 2 anchor)))
+         (space-below (- (nth 3 edges) below))
+         (space-above (- (cadr anchor) (cadr edges)))
+         ;; Reserve the internal padding and the child frame's border.
+         (max-height (max 1 (/ (- (max space-below space-above) 10)
+                               (frame-char-height parent))))
+         (width (max 3 (min 50 (- (frame-width parent) 4)
+                            (max (1+ (string-width title))
+                                 (+ 3 (apply #'max (mapcar (lambda (choice)
+                                                           (string-width (car choice))) choices)))))))
          (buffer (generate-new-buffer " *neo-diredy-choices*"))
          (keys (plist-get options :keys)) (disabled (plist-get options :disabled))
          (index 0) popup)
@@ -355,45 +381,46 @@ and :footer.  Without OPTIONS the existing opener behavior is unchanged."
                    (no-other-frame . t) (skip-taskbar . t) (desktop-dont-save . t)
                    (menu-bar-lines . 0) (tool-bar-lines . 0) (tab-bar-lines . 0)
                    (vertical-scroll-bars . nil) (horizontal-scroll-bars . nil)
-                   (left-fringe . 0) (right-fringe . 0) (internal-border-width . 8)
+                   (left-fringe . 0) (right-fringe . 0) (internal-border-width . 4)
                    (child-frame-border-width . 1) (min-width . 1) (min-height . 1)
                    (font . ,(frame-parameter parent 'font))
                    (background-color . ,(face-background 'default parent t))
                    (foreground-color . ,(face-foreground 'default parent t))
-                   (width . ,width) (height . ,height))))
+                   (width . ,width) (height . 1))))
+          (set-face-attribute 'child-frame-border popup
+                              :background (face-foreground 'shadow parent t))
           (set-window-buffer (frame-root-window popup) buffer)
           (catch 'chosen
             (while (and (frame-live-p parent) (frame-live-p popup))
-              (set-frame-height
-               popup (min (max 5 (- (frame-height parent) 6))
-                          (+ 3 (length choices)
-                             (ceiling (+ 2 (string-width (car (nth index choices)))) (max 1 (1- width))))))
-              (set-frame-position popup
-                                  (max 0 (/ (- (frame-pixel-width parent) (frame-pixel-width popup)) 2))
-                                  (max 0 (/ (- (frame-pixel-height parent) (frame-pixel-height popup)) 2)))
-              (with-current-buffer buffer
-                (let ((inhibit-read-only t))
-                  (erase-buffer)
-                  (insert (propertize
-                           (truncate-string-to-width
-                            title
-                            width nil nil t) 'face 'bold) "\n\n")
-                  (cl-loop for choice in choices for row from 0 do
-                           (insert (propertize
-                                    (concat (if (= row index) "› " "  ")
-                                            (if (= row index) (car choice)
-                                              (truncate-string-to-width (car choice) (- width 2) nil nil t))
-                                            "\n")
-                                    'face (cond ((assoc (cdr choice) disabled) 'shadow)
-                                                ((= row index) 'highlight) (t 'default)))))
-                  (insert (propertize
-                           (concat "\n" (or (cdr (assoc (cdr (nth index choices)) disabled))
-                                            (plist-get options :footer)
-                                            "↑↓/j k: select   Enter: confirm   Esc: cancel"))
-                           'face 'shadow))
-                  (goto-char (point-min))
-                  (forward-line (+ 2 index))
-                  (set-window-point (frame-root-window popup) (point))))
+              (let ((footer (or (cdr (assoc (cdr (nth index choices)) disabled))
+                                (plist-get options :footer))))
+                (set-frame-height
+                 popup (min max-height
+                            (+ (length choices) (if footer 1 0)
+                               (ceiling (+ 2 (string-width (car (nth index choices)))) (1- width)))))
+                (set-frame-position
+                 popup (max 0 (min (car anchor) (- (frame-pixel-width parent) (frame-pixel-width popup) 2)))
+                 (if (<= (frame-pixel-height popup) space-below) below
+                   (max (cadr edges) (- (cadr anchor) (frame-pixel-height popup) 2))))
+                (with-current-buffer buffer
+                  (let ((inhibit-read-only t))
+                    (erase-buffer)
+                    (insert (propertize (truncate-string-to-width title (1- width) nil nil t)
+                                        'face 'bold) "\n")
+                    (cl-loop for choice in choices for row from 0 do
+                             (insert (propertize
+                                      (concat (if (= row index) "› " "  ")
+                                              (if (= row index) (car choice)
+                                                (truncate-string-to-width (car choice) (- width 3) nil nil t)))
+                                      'face (cond ((assoc (cdr choice) disabled) 'shadow)
+                                                  ((= row index) 'highlight) (t 'default))))
+                             (when (< row (1- (length choices))) (insert "\n")))
+                    (when footer
+                      (insert "\n" (propertize (truncate-string-to-width footer (1- width) nil nil t)
+                                                 'face 'shadow)))
+                    (goto-char (point-min))
+                    (forward-line (1+ index))
+                    (set-window-point (frame-root-window popup) (point)))))
               (unless (frame-visible-p popup) (make-frame-visible popup))
               (redisplay t)
               (let* ((event (read-key nil t)) (shortcut (assq event keys)))
@@ -423,7 +450,7 @@ and :footer.  Without OPTIONS the existing opener behavior is unchanged."
     (unless file (user-error "No file on this line"))
     (neo-diredy--check-open-file file)
     (when-let* ((choice (neo-diredy--read-choice
-                        (concat "Open: " (file-name-nondirectory (directory-file-name file)))
+                        "Open"
                         (neo-diredy--open-choices file))))
       (neo-diredy--open-file file (cdr choice)))))
 
@@ -954,7 +981,7 @@ foreach ($group in $groups) {
                         (format "Actions · %d" (length files)) choices
                         (list :keys '((?c . copy) (?x . cut) (?v . paste) (?r . reveal) (?d . delete)
                                       (?? . targets) (?m . mark) (?a . all) (?u . unmark) (?q . clear) (?! . results))
-                              :disabled disabled :footer "↑↓ / key · Enter · Esc"))))
+                              :disabled disabled))))
       (pcase (cdr choice)
         ('copy (neo-diredy-copy)) ('cut (neo-diredy-cut)) ('paste (neo-diredy-paste))
         ('reveal (neo-diredy-reveal)) ('delete (neo-diredy-delete))
