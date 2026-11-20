@@ -100,6 +100,8 @@ scripts are not supported."
 (defvar neo-diredy--selected-icon nil)
 (defvar neo-diredy--timer nil)
 (defvar neo-diredy--key nil)
+(defvar neo-diredy--choice-frame nil "Hidden menu frame retained while the layout is active.")
+(defvar neo-diredy--choice-buffer nil "Empty menu buffer retained with the hidden frame.")
 (defvar neo-diredy--directory nil)
 (defvar neo-diredy--decorated nil)
 (defvar neo-diredy--preview-key nil)
@@ -328,6 +330,14 @@ Advising its layout function does not load or require the optional package.")
     (error (user-error "Could not open %s: %s" (file-name-nondirectory file)
                        (error-message-string err)))))
 
+(defun neo-diredy--choice-clear ()
+  "Release the reusable menu frame."
+  (when (frame-live-p neo-diredy--choice-frame)
+    (delete-frame neo-diredy--choice-frame t))
+  (when (buffer-live-p neo-diredy--choice-buffer)
+    (kill-buffer neo-diredy--choice-buffer))
+  (setq neo-diredy--choice-frame nil neo-diredy--choice-buffer nil))
+
 (defun neo-diredy--choice-anchor (window)
   "Return (X Y HEIGHT) for the selected row in WINDOW, in frame pixels."
   (redisplay t)
@@ -351,6 +361,7 @@ OPTIONS may contain :keys (character . value), :disabled (value . reason)
 and :footer.  Place the menu below the selected row, or above if needed."
   (unless (display-graphic-p) (user-error "This menu requires a graphical frame"))
   (unless choices (user-error "No choices available"))
+  (unless (frame-live-p neo-diredy--choice-frame) (neo-diredy--choice-clear))
   (let* ((parent (selected-frame))
          (origin (selected-window))
          (anchor (neo-diredy--choice-anchor origin))
@@ -365,7 +376,12 @@ and :footer.  Place the menu below the selected row, or above if needed."
                             (max (1+ (string-width title))
                                  (+ 3 (apply #'max (mapcar (lambda (choice)
                                                            (string-width (car choice))) choices)))))))
-         (buffer (generate-new-buffer " *neo-diredy-choices*"))
+         (buffer (or (and (frame-live-p neo-diredy--choice-frame)
+                          (not (frame-visible-p neo-diredy--choice-frame))
+                          (eq (frame-parent neo-diredy--choice-frame) parent)
+                          (buffer-live-p neo-diredy--choice-buffer)
+                          neo-diredy--choice-buffer)
+                     (generate-new-buffer " *neo-diredy-choices*")))
          (keys (plist-get options :keys)) (disabled (plist-get options :disabled))
          (index 0) popup)
     (unwind-protect
@@ -374,21 +390,43 @@ and :footer.  Place the menu below the selected row, or above if needed."
             (delay-mode-hooks (special-mode))
             (setq-local mode-line-format nil header-line-format nil tab-line-format nil
                         display-line-numbers nil truncate-lines nil cursor-type nil))
+          (when (and (frame-live-p neo-diredy--choice-frame)
+                     (not (frame-visible-p neo-diredy--choice-frame))
+                     (not (eq (frame-parent neo-diredy--choice-frame) parent)))
+            (neo-diredy--choice-clear))
           (setq popup
-                (make-frame
-                 `((parent-frame . ,parent) (minibuffer . nil) (visibility . nil)
-                   (undecorated . t) (no-accept-focus . t) (no-focus-on-map . t)
-                   (no-other-frame . t) (skip-taskbar . t) (desktop-dont-save . t)
-                   (menu-bar-lines . 0) (tool-bar-lines . 0) (tab-bar-lines . 0)
-                   (vertical-scroll-bars . nil) (horizontal-scroll-bars . nil)
-                   (left-fringe . 0) (right-fringe . 0) (internal-border-width . 4)
-                   (child-frame-border-width . 1) (min-width . 1) (min-height . 1)
-                   (font . ,(frame-parameter parent 'font))
-                   (background-color . ,(face-background 'default parent t))
-                   (foreground-color . ,(face-foreground 'default parent t))
-                   (width . ,width) (height . 1))))
-          (set-face-attribute 'child-frame-border popup
-                              :background (face-foreground 'shadow parent t))
+                (or (and (frame-live-p neo-diredy--choice-frame)
+                         (not (frame-visible-p neo-diredy--choice-frame))
+                         neo-diredy--choice-frame)
+                    (make-frame
+                     `((parent-frame . ,parent) (minibuffer . nil) (visibility . nil)
+                       (undecorated . t) (no-accept-focus . t) (no-focus-on-map . t)
+                       (no-other-frame . t) (skip-taskbar . t) (desktop-dont-save . t)
+                       (menu-bar-lines . 0) (tool-bar-lines . 0) (tab-bar-lines . 0)
+                       (vertical-scroll-bars . nil) (horizontal-scroll-bars . nil)
+                       (left-fringe . 0) (right-fringe . 0) (internal-border-width . 4)
+                       (child-frame-border-width . 1) (min-width . 1) (min-height . 1)
+                       (font . ,(frame-parameter parent 'font))
+                       (background-color . ,(face-background 'default parent t))
+                       (foreground-color . ,(face-foreground 'default parent t))
+                       (width . ,width) (height . 1)))))
+          ;; A nested menu gets a temporary frame instead of overwriting the
+          ;; visible menu.  Retain at most one hidden frame between commands.
+          (when (and neo-diredy--layout-mode
+                     (or (eq popup neo-diredy--choice-frame) (not (frame-live-p neo-diredy--choice-frame))))
+            (setq neo-diredy--choice-frame popup neo-diredy--choice-buffer buffer))
+          ;; Refresh appearance on reuse without invalidating unchanged faces.
+          (let ((parameters `((font . ,(frame-parameter parent 'font))
+                              (background-color . ,(face-background 'default parent t))
+                              (foreground-color . ,(face-foreground 'default parent t))
+                              (width . ,width))))
+            (setq parameters (cl-remove-if (lambda (entry)
+                                            (equal (frame-parameter popup (car entry)) (cdr entry)))
+                                          parameters))
+            (when parameters (modify-frame-parameters popup parameters)))
+          (unless (equal (face-background 'child-frame-border popup t) (face-foreground 'shadow parent t))
+            (set-face-attribute 'child-frame-border popup
+                                :background (face-foreground 'shadow parent t)))
           (set-window-buffer (frame-root-window popup) buffer)
           (catch 'chosen
             (while (and (frame-live-p parent) (frame-live-p popup))
@@ -436,8 +474,17 @@ and :footer.  Place the menu below the selected row, or above if needed."
                   ((or 'escape ?\e ?\C-g) (throw 'chosen nil))
                   (_ (when (or (mouse-event-p event) (eq (car-safe event) 'switch-frame))
                        (throw 'chosen nil)))))))))
-      (when (frame-live-p popup) (delete-frame popup t))
-      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+      (when (frame-live-p popup)
+        (if (and neo-diredy--layout-mode (eq popup neo-diredy--choice-frame))
+            (make-frame-invisible popup t)
+          (delete-frame popup t)))
+      (when (buffer-live-p buffer)
+        (if (and neo-diredy--layout-mode (frame-live-p neo-diredy--choice-frame)
+                 (eq buffer neo-diredy--choice-buffer))
+            ;; Keep an empty private buffer in the hidden window.  Killing it
+            ;; would make Emacs display (and retain) an unrelated Dired buffer.
+            (with-current-buffer buffer (let ((inhibit-read-only t)) (erase-buffer)))
+          (kill-buffer buffer))))))
 
 ;;;###autoload
 (defun neo-diredy-open ()
@@ -2437,6 +2484,7 @@ stay plain."
   (neo-diredy--art-stop)
   (neo-diredy--details-stop)
   (neo-diredy--metadata-stop)
+  (neo-diredy--choice-clear)
   (advice-remove 'set-window-margins #'neo-diredy--protect-margins)
   (advice-remove 'mode-line-window-selected-p #'neo-diredy--modeline-active-p)
   (remove-hook 'pre-command-hook #'neo-diredy--modeline-select)

@@ -295,7 +295,7 @@
    (let ((unread-command-events '(?v ?c)) (frames (frame-list)))
      (neo-diredy-actions)
      (should (equal neo-diredy--clipboard (cons 'copy (list file))))
-     (should (equal (frame-list) frames))
+     (should-not (cl-remove-if-not #'frame-visible-p (cl-set-difference (frame-list) frames)))
      (should (neo-diredy--layout-intact-p)))))
 
 (ert-deftest neo-diredy-actions-gui-menu-cancel-preserves-selection ()
@@ -307,4 +307,4 @@
      (neo-diredy-actions)
      (should (= (point) point))
      (should (equal (neo-diredy--action-marks) (list file)))
-     (should (equal (frame-list) frames)))))
+     (should-not (cl-remove-if-not #'frame-visible-p (cl-set-difference (frame-list) frames))))))

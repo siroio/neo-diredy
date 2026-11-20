@@ -276,7 +276,7 @@
    (let ((frames (frame-list)))
      (execute-kbd-macro (kbd "C-c b j RET"))
      (should (equal default-directory (file-name-as-directory child)))
-     (should-not (cl-set-difference (frame-list) frames))
+     (should-not (cl-remove-if-not #'frame-visible-p (cl-set-difference (frame-list) frames)))
      (let ((position (point)) (window (selected-window)) viewer)
        (execute-kbd-macro (kbd "M-<down>"))
        (redisplay t)
@@ -292,7 +292,7 @@
        (should (= (point) position)))
      (execute-kbd-macro (kbd "C-c b d <escape>"))
      (should (bookmark-get-bookmark "Child" t))
-     (should-not (cl-set-difference (frame-list) frames)))))
+     (should-not (cl-remove-if-not #'frame-visible-p (cl-set-difference (frame-list) frames))))))
 
 (ert-deftest neo-diredy-workflow-gui-image-expands-to-window ()
   (skip-unless (and (display-graphic-p) (image-type-available-p 'pbm)))
