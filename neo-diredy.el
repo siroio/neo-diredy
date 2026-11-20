@@ -1276,6 +1276,32 @@ foreach ($group in $groups) {
     (setq right (if (>= (window-total-width neo-diredy--center) 32) 16 0)))
   (funcall original window left right))
 
+(defun neo-diredy--dwim-targets (original &rest args)
+  "Exclude the owned modeline from standard Dired destination policies."
+  (if (or (not (window-live-p neo-diredy--modeline-window))
+          (not (eq (window-buffer neo-diredy--modeline-window)
+                   (cdr (assq neo-diredy--modeline-window neo-diredy--windows))))
+          (and (functionp dired-dwim-target)
+               (not (memq dired-dwim-target
+                          '(dired-dwim-target-next dired-dwim-target-next-visible
+                            dired-dwim-target-recent)))))
+      (apply original args)
+    (let* ((recent (eq dired-dwim-target 'dired-dwim-target-recent))
+           (frames (and (memq dired-dwim-target
+                              '(dired-dwim-target-next-visible dired-dwim-target-recent))
+                        'visible))
+           (windows (remq neo-diredy--modeline-window
+                          (remq (selected-window)
+                                (window-list-1 (next-window nil 'nomini frames)
+                                               'nomini frames)))))
+      (when recent
+        (setq windows (sort windows (lambda (a b) (> (window-use-time a) (window-use-time b))))))
+      (mapcan (lambda (window)
+                (with-current-buffer (window-buffer window)
+                  (when (eq major-mode 'dired-mode)
+                    (list (dired-current-directory)))))
+              windows))))
+
 (defun neo-diredy--modeline-select ()
   "Return keyboard commands to the list after a mode-line mouse action."
   (when (and (window-live-p neo-diredy--center)
@@ -2418,6 +2444,18 @@ stay plain."
       ;; leave the center selected and replacements of existing windows.
       (setq neo-diredy--configuration nil)
       (neo-diredy--layout-mode -1))
+     ((and (not (eq (selected-window) neo-diredy--center))
+           (eq (selected-frame) (window-frame neo-diredy--center))
+           (not (active-minibuffer-window))
+           (not (window-dedicated-p))
+           (with-current-buffer (window-buffer (selected-window))
+             (and (derived-mode-p 'dired-mode 'wdired-mode)
+                  (not (file-remote-p default-directory)))))
+      ;; Another real Dired list now owns the selection.  Release only our
+      ;; auxiliary panes; restoring the saved configuration would reselect
+      ;; the old list and could discard navigation in the other window.
+      (setq neo-diredy--configuration nil)
+      (neo-diredy--layout-mode -1))
      ((eq (selected-window) neo-diredy--center)
       (with-current-buffer (window-buffer neo-diredy--center)
         ;; Mode/state switches can alter presentation without moving point or
@@ -2487,6 +2525,7 @@ stay plain."
   (neo-diredy--choice-clear)
   (advice-remove 'set-window-margins #'neo-diredy--protect-margins)
   (advice-remove 'mode-line-window-selected-p #'neo-diredy--modeline-active-p)
+  (advice-remove 'dired-dwim-target-directories #'neo-diredy--dwim-targets)
   (remove-hook 'pre-command-hook #'neo-diredy--modeline-select)
   (dolist (command '(dired-hide-subdir dired-kill-subdir))
     (advice-remove command #'neo-diredy--subdir-command))
@@ -2625,6 +2664,7 @@ All ordinary Dired operations remain available."
             (add-hook 'window-selection-change-functions #'neo-diredy--modeline-activity)
             (advice-add 'set-window-margins :around #'neo-diredy--protect-margins)
             (advice-add 'mode-line-window-selected-p :around #'neo-diredy--modeline-active-p)
+            (advice-add 'dired-dwim-target-directories :around #'neo-diredy--dwim-targets)
             (add-hook 'window-size-change-functions #'neo-diredy--details-resize)
             (dolist (command neo-diredy--layout-commands)
               (advice-add command :before #'neo-diredy--before-layout-change))

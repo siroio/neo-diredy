@@ -53,7 +53,7 @@ https://github.com/siroio/neo-diredy
 - ファイルを開くと補助欄を閉じます。タブを切り替える前にも閉じ、空の補助欄を保存タブに残しません。
 - 別の画面がウィンドウを追加・再利用したときは、neo-diredyの補助欄だけを閉じます。ヘルプやプラグインが開いたウィンドウを、以前の画面構成で上書きしません。Neo Gitでは画面構成を保存する直前に補助欄を閉じ、終了後にDiredへ戻れるようにします。Neo Git自体を依存パッケージとして読み込むことはありません。
 - ヘルプなどを開いてDiredが選択されたままの場合は、3カラム表示の自動再作成を保留します。ヘルプを閉じる、別画面からDiredに戻る、元の画面構成に戻す、Diredでカーソルを移動する、Diredを開き直す、といった操作で再開します。M-xを開いて取り消すだけでは再作成しません。
-- 一度に表示できる3カラムのレイアウトは1つです。幅72桁未満のウィンドウとリモートディレクトリでは通常のDiredを使います。
+- 一度に表示できる3カラムのレイアウトは1つです。上下などに分割して複数のDiredを開いた場合は、選択した一覧へ3カラム表示と操作メニューが移ります。ステータス表示用の欄は標準Diredのコピー・移動先候補に含めません。幅72桁未満のウィンドウとリモートディレクトリでは通常のDiredを使います。
 - 配色は現在のテーマを継承します。選択行は `neo-diredy-selection` faceで調整できます。
 - modelineは設定済みの `mode-line-format` を変更せず、3ペイン全体の下部左端から表示します。行・桁、メジャーモード、文字コード、画像など、通常の表示をそのまま使います。modelineは同じDiredバッファを表示する専用ウィンドウに置き、中央のカーソル位置と同期します。`%p` などウィンドウの表示範囲に依存する項目は、下部ウィンドウを基準に計算されます。
 
@@ -252,6 +252,7 @@ emacs -Q --batch -l tests/neo-diredy-navigation-tests.el -f ert-run-tests-batch-
 emacs -Q --batch -l tests/neo-diredy-open-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-workflow-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-actions-tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l tests/neo-diredy-split-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/neo-diredy-reveal-tests.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l tests/check-package.el
 emacs -Q --batch -l benchmarks/run.el
