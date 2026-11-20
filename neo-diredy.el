@@ -96,6 +96,8 @@ scripts are not supported."
   "Selection and window contents held until navigation after a handoff.")
 (defvar neo-diredy--buffers nil)
 (defvar neo-diredy--existing-buffers nil)
+(defvar neo-diredy--owned-dired-buffers nil
+  "Directories created while enabled, including retained return destinations.")
 (defvar neo-diredy--overlays nil)
 (defvar neo-diredy--selected-icon nil)
 (defvar neo-diredy--timer nil)
@@ -1194,6 +1196,8 @@ foreach ($group in $groups) {
 (defun neo-diredy--style ()
   "Temporarily style the current Dired buffer, saving its original state."
   (unless (assq (current-buffer) neo-diredy--buffers)
+    (unless (memq (current-buffer) neo-diredy--existing-buffers)
+      (cl-pushnew (current-buffer) neo-diredy--owned-dired-buffers))
     (push (list (current-buffer)
                 (mapcar (lambda (variable)
                           (list variable (local-variable-p variable)
@@ -2495,21 +2499,21 @@ stay plain."
                 (window-list nil 'no-minibuffer))))
 
 (defun neo-diredy--cleanup-dired-buffers ()
-  "Dispose of unused directories created during the active layout."
-  (dolist (entry neo-diredy--buffers)
-    (let ((buffer (car entry)))
-      (when (and (buffer-live-p buffer)
-                 (not (memq buffer neo-diredy--existing-buffers))
-                 (not (eq buffer (car neo-diredy--decorated)))
-                 (not (tab-bar-get-buffer-tab buffer t))
-                 (with-current-buffer buffer
-                   (and (derived-mode-p 'dired-mode)
-                        (not (derived-mode-p 'wdired-mode))
-                        (not (buffer-modified-p))
-                        (not (save-excursion
-                               (goto-char (point-min))
-                               (re-search-forward "^[^ \n\r]" nil t))))))
-        (kill-buffer buffer))))
+  "Dispose of unused owned directories across layout lifetimes."
+  (dolist (buffer neo-diredy--owned-dired-buffers)
+    (when (and (buffer-live-p buffer)
+               (not (eq buffer (car neo-diredy--decorated)))
+               (not (tab-bar-get-buffer-tab buffer t))
+               (with-current-buffer buffer
+                 (and (derived-mode-p 'dired-mode)
+                      (not (derived-mode-p 'wdired-mode))
+                      (not (buffer-modified-p))
+                      (not (save-excursion
+                             (goto-char (point-min))
+                             (re-search-forward "^[^ \n\r]" nil t))))))
+      (kill-buffer buffer)))
+  (setq neo-diredy--owned-dired-buffers
+        (seq-filter #'buffer-live-p neo-diredy--owned-dired-buffers))
   (setq neo-diredy--buffers
         (seq-filter (lambda (entry) (buffer-live-p (car entry)))
                     neo-diredy--buffers)))
@@ -2599,8 +2603,13 @@ stay plain."
   (dolist (entry neo-diredy--buffers)
     (when (and (caddr entry) (buffer-live-p (car entry)))
       (with-current-buffer (car entry) (dired-preview-mode 1))))
-  (neo-diredy--cleanup-dired-buffers)
-  (setq neo-diredy--buffers nil neo-diredy--existing-buffers nil neo-diredy--overlays nil
+  (when neo-diredy--buffers (neo-diredy--cleanup-dired-buffers))
+  ;; Opening a file or a popup only ends this layout.  Keep ownership until
+  ;; the global mode is disabled so unused return directories can be retired
+  ;; on the next visit, instead of becoming permanently "pre-existing".
+  (unless neo-diredy-mode
+    (setq neo-diredy--existing-buffers nil neo-diredy--owned-dired-buffers nil))
+  (setq neo-diredy--buffers nil neo-diredy--overlays nil
         neo-diredy--selected-icon nil
         neo-diredy--windows nil neo-diredy--center nil
         neo-diredy--left nil neo-diredy--right nil neo-diredy--margins nil
@@ -2629,8 +2638,9 @@ All ordinary Dired operations remain available."
           (when (file-remote-p default-directory) (user-error "Use this layout in a local directory"))
           (when (< (window-total-width) 72) (user-error "The Dired window needs at least 72 columns"))
           (progn
+            (unless neo-diredy-mode
+              (setq neo-diredy--existing-buffers (buffer-list)))
             (setq neo-diredy--handoff nil
-                  neo-diredy--existing-buffers (buffer-list)
                   neo-diredy--configuration (current-window-configuration)
                   neo-diredy--center (selected-window)
                   neo-diredy--modeline-parameter (window-parameter nil 'mode-line-format)
@@ -2709,6 +2719,8 @@ Disable to restore normal Dired.  Narrow and remote windows are left alone."
   (setq neo-diredy--handoff nil)
   (if neo-diredy-mode
       (progn
+        (unless neo-diredy--existing-buffers
+          (setq neo-diredy--existing-buffers (buffer-list)))
         (add-hook 'post-command-hook #'neo-diredy--auto-enable 90)
         (dolist (command '(dired dired-other-window dired-other-frame))
           (advice-add command :after #'neo-diredy--auto-enable))

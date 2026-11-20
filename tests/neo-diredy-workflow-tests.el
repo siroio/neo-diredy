@@ -207,6 +207,99 @@
      (should (eq (current-buffer) visited))
      (should (equal (dired-get-filename) nested)))))
 
+(ert-deftest neo-diredy-workflow-cleanup-bounds-reentered-layouts ()
+  (neo-diredy-test--with-directory
+   (let ((source (current-buffer)) (dired-kill-when-opening-new-dired-buffer nil)
+         previous files)
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (dotimes (i 6)
+             (let* ((directory (expand-file-name (format "visit-%d" i) root))
+                    (text (expand-file-name "example.txt" directory)))
+               (make-directory directory)
+               (with-temp-file text (insert "example\n"))
+               ;; Reenter directly from a file, without an active layout.
+               (dired directory)
+               (run-hooks 'post-command-hook)
+               (when previous (should-not (buffer-live-p previous)))
+               (setq previous (current-buffer))
+               (dired-goto-file text)
+               (dired-find-file)
+               (run-hooks 'post-command-hook)
+               (push (current-buffer) files)
+               (should (buffer-live-p previous))
+               (switch-to-prev-buffer)
+               (should (eq (current-buffer) previous))
+               (run-hooks 'post-command-hook)
+               (switch-to-buffer (car files))
+               (run-hooks 'post-command-hook)))
+           (dired root)
+           (run-hooks 'post-command-hook)
+           (should-not (buffer-live-p previous))
+           (should (buffer-live-p source))
+           ;; Reading files is still an explicit visit, not a disposable preview.
+           (should (cl-every #'buffer-live-p files)))
+       (neo-diredy-mode -1)))))
+
+(ert-deftest neo-diredy-workflow-cleanup-reentry-protects-user-state ()
+  (dolist (kind '(existing marked modified wdired visible saved-tab))
+    (neo-diredy-test--with-directory
+     (let ((nested (expand-file-name "nested.txt" child)) visited
+           (tabs (frame-parameter nil 'tabs)))
+       (with-temp-file nested (insert "example"))
+       (when (eq kind 'existing) (dired-noselect child))
+       (unwind-protect
+           (progn
+             (neo-diredy-mode 1)
+             (dired child)
+             (run-hooks 'post-command-hook)
+             (setq visited (current-buffer))
+             (dired-goto-file nested)
+             (pcase kind
+               ('marked (dired-mark 1))
+               ('modified (set-buffer-modified-p t))
+               ('wdired (wdired-change-to-wdired-mode)))
+             (neo-diredy--layout-mode -1)
+             (pcase kind
+               ('visible (set-window-buffer (split-window-below) visited))
+               ('saved-tab
+                (set-frame-parameter
+                 nil 'tabs (list (car (tab-bar-tabs))
+                                 `(tab (name . "Saved")
+                                       (ws . ,(window-state-get (frame-root-window) t)))))))
+             (dired root)
+             (run-hooks 'post-command-hook)
+             (should (buffer-live-p visited))
+             (neo-diredy-mode -1)
+             (should (buffer-live-p visited)))
+         (neo-diredy-mode -1)
+         (set-frame-parameter nil 'tabs tabs))))))
+
+(ert-deftest neo-diredy-workflow-cleanup-disable-keeps-return-directory ()
+  (neo-diredy-test--with-directory
+   (let ((nested (expand-file-name "nested.txt" child)) visited)
+     (with-temp-file nested (insert "example"))
+     (unwind-protect
+         (progn
+           (neo-diredy-mode 1)
+           (dired child)
+           (run-hooks 'post-command-hook)
+           (setq visited (current-buffer))
+           (dired-goto-file nested)
+           (dired-find-file)
+           (run-hooks 'post-command-hook)
+           (neo-diredy-mode -1)
+           (should (buffer-live-p visited))
+           (switch-to-prev-buffer)
+           (should (eq (current-buffer) visited))
+           ;; A later enable starts with these directories as user buffers.
+           (neo-diredy-mode 1)
+           (dired root)
+           (run-hooks 'post-command-hook)
+           (should (buffer-live-p visited)))
+       (neo-diredy-mode -1)))))
+
 (ert-deftest neo-diredy-workflow-preview-close-respects-mode-disable ()
   (neo-diredy-test--with-directory
    (unwind-protect
