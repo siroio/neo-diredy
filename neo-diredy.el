@@ -1314,8 +1314,12 @@ foreach ($group in $groups) {
 
 (defun neo-diredy--modeline-resize (frame)
   "Refit the native bar after fonts or window dimensions change on FRAME."
-  (when (and neo-diredy--layout-mode (neo-diredy--layout-intact-p)
-             (eq frame (window-frame neo-diredy--center)))
+  ;; A temporary side window can enlarge the bar to the normal minimum
+  ;; height.  Refit it even while that popup makes the full layout non-intact;
+  ;; `neo-diredy--modeline-sync' still checks ownership of the bar itself.
+  (when (and neo-diredy--layout-mode (window-live-p neo-diredy--center)
+             (eq frame (window-frame neo-diredy--center))
+             (assq (window-buffer neo-diredy--center) neo-diredy--buffers))
     (neo-diredy--modeline-sync)))
 
 (defun neo-diredy--modeline-activity (&rest _)
