@@ -17,6 +17,14 @@
 (defun neo-diredy-actions--contents (path)
   (with-temp-buffer (insert-file-contents path) (buffer-string)))
 
+(defun neo-diredy-actions--await-copy ()
+  (let ((deadline (+ (float-time) 30)))
+    (unwind-protect
+        (progn (while (and neo-diredy--copy-process (< (float-time) deadline))
+                 (accept-process-output nil 0.05))
+               (should-not neo-diredy--copy-process))
+      (neo-diredy-cancel-copy))))
+
 (ert-deftest neo-diredy-actions-targets-prefer-marks-and-ignore-delete-flags ()
   (neo-diredy-actions--with-files
    (should (equal (neo-diredy--action-targets) (list file)))
@@ -45,6 +53,9 @@
    (should (equal neo-diredy--clipboard (cons 'copy (list file))))
    (dired child)
    (neo-diredy-paste)
+   (should (processp neo-diredy--copy-process))
+   (should (string-match-p "Copying" (neo-diredy--action-status)))
+   (neo-diredy-actions--await-copy)
    (should (equal (neo-diredy-actions--contents (expand-file-name "hello.txt" child)) "hello preview\n"))
    (should (file-exists-p file))
    (should (equal (cdr neo-diredy--clipboard) (list file)))
@@ -83,6 +94,7 @@
    (neo-diredy-copy) (dired child)
    (cl-letf (((symbol-function 'neo-diredy--action-conflict) (lambda (&rest _) 'overwrite)))
      (neo-diredy-paste))
+   (neo-diredy-actions--await-copy)
    (should (equal (neo-diredy-actions--contents (expand-file-name "hello.txt" child)) "hello preview\n"))
    (let ((source (expand-file-name "folder" root)) (dest (expand-file-name "folder" child)))
      (make-directory source) (make-directory dest)
@@ -120,6 +132,7 @@
      (make-directory source) (with-temp-file inside (insert "inside"))
      (setq neo-diredy--clipboard (cons 'copy (list source)))
      (dired child) (neo-diredy-paste)
+     (neo-diredy-actions--await-copy)
      (should (equal (neo-diredy-actions--contents (expand-file-name "日本語 & 100%/nested.txt" child)) "inside")))))
 
 (ert-deftest neo-diredy-actions-quit-retains-unprocessed-cut-items ()
@@ -166,6 +179,7 @@
      (condition-case nil (make-symbolic-link file link) (file-error (ert-skip "Symlink privilege unavailable")))
      (setq neo-diredy--clipboard (cons 'copy (list link)))
      (dired child) (neo-diredy-paste)
+     (neo-diredy-actions--await-copy)
      (should (file-symlink-p (expand-file-name "link.txt" child))))))
 
 (ert-deftest neo-diredy-actions-move-preserves-unsaved-buffer-and-marks ()
@@ -193,15 +207,135 @@
      (should (equal (neo-diredy-actions--contents (expand-file-name "hello.txt" child)) "hello preview\n"))
      (should (equal neo-diredy--clipboard (cons 'cut (list other)))))))
 
-(ert-deftest neo-diredy-actions-partial-copy-error-is-visible-and-keeps-source ()
+(ert-deftest neo-diredy-actions-background-copy-preserves-newer-destination-and-reports-stage ()
   (neo-diredy-actions--with-files
-   (neo-diredy-copy) (dired child)
-   (cl-letf (((symbol-function 'dired-copy-file)
-              (lambda (_from to _overwrite) (with-temp-file to (insert "partial")) (error "Disk full"))))
-     (neo-diredy-paste))
-   (should (file-exists-p file))
-   (should (equal (cadar neo-diredy--action-results) 'failed))
-   (should (string-match-p "partial data" (nth 3 (car neo-diredy--action-results))))))
+   (let ((dest (expand-file-name "hello.txt" child)))
+     (with-temp-file dest (insert "old"))
+     (neo-diredy-copy) (dired child)
+     (cl-letf (((symbol-function 'neo-diredy--action-conflict) (lambda (&rest _) 'overwrite)))
+       (neo-diredy-paste))
+     (with-temp-file dest (insert "another writer"))
+     (neo-diredy-actions--await-copy)
+     (should (equal (neo-diredy-actions--contents dest) "another writer"))
+     (should (equal (cadar neo-diredy--action-results) 'failed))
+     (let ((detail (nth 3 (car neo-diredy--action-results))))
+       (should (string-match "staged data at \\(.*\\)" detail))
+       (should (equal (neo-diredy-actions--contents (match-string 1 detail)) "hello preview\n"))))))
+
+(ert-deftest neo-diredy-actions-background-cancel-retains-completed-and-staged-items ()
+  (neo-diredy-actions--with-files
+   (let* ((second (expand-file-name "slow.txt" root))
+          (third (expand-file-name "queued.txt" root))
+          (launch (symbol-function 'make-process))
+          ;; Pause only our child, after it writes a partial second item.
+          (delay-copy '(advice-add 'copy-file :around
+                                   (lambda (original from to &rest args)
+                                     (if (equal (file-name-nondirectory from) "slow.txt")
+                                         (progn (write-region "partial" nil to nil 'silent) (sleep-for 30))
+                                       (apply original from to args))))))
+     (dolist (item (list second third)) (with-temp-file item (insert "source")))
+     (setq neo-diredy--clipboard (list 'copy file second third))
+     (dired child)
+     (unwind-protect
+         (progn
+           (cl-letf (((symbol-function 'make-process)
+                      (lambda (&rest args)
+                        (let ((command (plist-get args :command)))
+                          (apply launch (plist-put args :command
+                                                  (append (butlast command 2)
+                                                          (list "--eval" (prin1-to-string delay-copy))
+                                                          (last command 2))))))))
+             (neo-diredy-paste))
+           (should-error (neo-diredy-paste) :type 'user-error)
+           (dired root)
+           (let* ((stage (process-get neo-diredy--copy-process 'stage))
+                  (partial (expand-file-name "1" stage)) (deadline (+ (float-time) 10)))
+             (while (and (< (float-time) deadline)
+                         (not (and (file-exists-p partial)
+                                   (file-exists-p (expand-file-name "hello.txt" child)))))
+               (accept-process-output nil 0.05))
+             (should (file-exists-p partial))
+             (should (equal (neo-diredy-actions--contents (expand-file-name "hello.txt" child)) "hello preview\n"))
+             (neo-diredy-cancel-copy)
+             (should-not neo-diredy--copy-process)
+             (should (equal (mapcar #'cadr neo-diredy--action-results) '(done pending pending)))
+             (should (string-match-p (regexp-quote partial) (nth 3 (cadr neo-diredy--action-results))))
+             (should (equal (neo-diredy-actions--contents partial) "partial"))
+             (should-not (file-exists-p (expand-file-name "slow.txt" child)))
+             (should-not (file-exists-p (expand-file-name "queued.txt" child)))))
+       (neo-diredy-cancel-copy)))))
+
+(ert-deftest neo-diredy-actions-background-duplicate-outputs-need-explicit-overwrite ()
+  (neo-diredy-actions--with-files
+   (let ((other (expand-file-name "other/hello.txt" root)) (asked 0))
+     (make-directory (file-name-directory other)) (with-temp-file other (insert "second"))
+     (with-temp-file (expand-file-name "hello.txt" child) (insert "existing"))
+     (setq neo-diredy--clipboard (list 'copy file other)) (dired child)
+     (cl-letf (((symbol-function 'neo-diredy--action-conflict)
+                (lambda (_from _to regular)
+                  (should regular)
+                  (if (= (cl-incf asked) 1) 'overwrite-all 'overwrite))))
+       (neo-diredy-paste))
+     (should (= asked 2))
+     (neo-diredy-actions--await-copy)
+     (should (equal (mapcar #'cadr neo-diredy--action-results) '(done done)))
+     (should (equal (neo-diredy-actions--contents (expand-file-name "hello.txt" child)) "second")))))
+
+(ert-deftest neo-diredy-actions-background-overwrite-honors-dired-backup ()
+  (neo-diredy-actions--with-files
+   (let* ((dired-backup-overwrite 'always)
+          (dest (expand-file-name "hello.txt" child))
+          (backup-directory-alist nil) (version-control 'never))
+     (with-temp-file dest (insert "original"))
+     (neo-diredy-copy) (dired child)
+     (cl-letf (((symbol-function 'neo-diredy--action-conflict) (lambda (&rest _) 'overwrite)))
+       (neo-diredy-paste))
+     (neo-diredy-actions--await-copy)
+     (should (equal (mapcar #'cadr neo-diredy--action-results) '(done)))
+     (should (equal (neo-diredy-actions--contents (make-backup-file-name dest)) "original"))
+     (should-not (directory-files child nil "\\`\\.neo-diredy-copy-")))))
+
+(ert-deftest neo-diredy-actions-explorer-filedrop-through-menu-without-system-clipboard ()
+  (skip-unless (eq system-type 'windows-nt))
+  (neo-diredy-actions--with-files
+   (let* ((folder (expand-file-name "日本語 😀 & 100%" root))
+          (nested (expand-file-name "nested.txt" folder))
+          (process-environment (copy-sequence process-environment))
+          ;; Substitute the data source only. Exercise the production FileDrop
+          ;; lookup, PowerShell serialization and paste using a private IDataObject.
+          (neo-diredy--explorer-files-script
+           (string-replace
+            "[Windows.Forms.Clipboard]::GetDataObject()"
+            (concat "[Windows.Forms.DataObject]::new()\n"
+                    "$data.SetData([Windows.Forms.DataFormats]::Text,$false,'ignored text')\n"
+                    "if ($env:NEO_DIREDY_TEST_DROP) {\n"
+                    "  $data.SetData([Windows.Forms.DataFormats]::FileDrop,$false,"
+                    "[string[]]([Text.Encoding]::UTF8.GetString("
+                    "[Convert]::FromBase64String($env:NEO_DIREDY_TEST_DROP)) | ConvertFrom-Json))\n}")
+            neo-diredy--explorer-files-script)))
+     (setenv "TEMP" root) (setenv "TMP" root) (setenv "NEO_DIREDY_TEST_DROP" nil)
+     (make-directory folder) (with-temp-file nested (insert "nested"))
+     (neo-diredy-cut) (dired child)
+     (should-not (neo-diredy--explorer-files))
+     (should-error (neo-diredy-paste-from-explorer) :type 'user-error)
+     (should-not neo-diredy--copy-process)
+     (with-temp-file (expand-file-name "hello.txt" child) (insert "existing"))
+     (setenv "NEO_DIREDY_TEST_DROP" (neo-diredy--copy-encode (vector file nested folder file)))
+     (cl-letf (((symbol-function 'neo-diredy--read-choice)
+                (lambda (_ choices options)
+                  (should (eq (alist-get ?e (plist-get options :keys)) 'explorer-paste))
+                  (rassq 'explorer-paste choices)))
+               ((symbol-function 'neo-diredy--action-conflict)
+                (lambda (_from _to overwrite)
+                  (should overwrite) (expand-file-name "new.txt" child))))
+       (neo-diredy-actions))
+     (neo-diredy-actions--await-copy)
+     (should (equal (mapcar #'cadr neo-diredy--action-results) '(done done)))
+     (should (equal (neo-diredy-actions--contents (expand-file-name "日本語 😀 & 100%/nested.txt" child)) "nested"))
+     (should (equal (neo-diredy-actions--contents (expand-file-name "new.txt" child)) "hello preview\n"))
+     (should (equal (neo-diredy-actions--contents (expand-file-name "hello.txt" child)) "existing"))
+     (should (equal neo-diredy--clipboard (list 'cut file)))
+     (should (file-exists-p file)))))
 
 (ert-deftest neo-diredy-actions-overwrite-all-cannot-replace-earlier-batch-output ()
   (neo-diredy-actions--with-files

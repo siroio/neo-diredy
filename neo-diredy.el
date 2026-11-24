@@ -28,6 +28,8 @@
 (require 'tab-bar)
 (require 'bookmark)
 (declare-function dired-preview-mode "dired-preview" (&optional arg))
+(declare-function dired-query "dired-aux" (sym prompt &rest args))
+(defvar dired-backup-overwrite)
 (declare-function wdired-get-filename "wdired" (&optional no-dir old))
 (declare-function evil-append "evil-commands" (count &optional vcount skip-empty-lines))
 (declare-function evil-define-key* "evil-core" (state keymap key def &rest bindings))
@@ -506,6 +508,7 @@ and :footer.  Place the menu below the selected row, or above if needed."
 ;;; Single and marked file actions
 
 (defvar neo-diredy--action-results nil "Last (source status destination detail) results.")
+(defvar neo-diredy--copy-process nil "Active background copy, independent of the layout.")
 (defvar-local neo-diredy--mark-cache nil)
 (defvar neo-diredy--action-paint-key nil)
 (defvar neo-diredy--action-overlays nil)
@@ -549,15 +552,16 @@ and :footer.  Place the menu below the selected row, or above if needed."
          (files (delete-dups
                  (mapcar #'directory-file-name
                          (seq-remove (lambda (f) (member (file-name-nondirectory f) '("." ".."))) files)))))
-    (when collapse
-      (setq files
-            (seq-remove
-             (lambda (file)
-               (cl-some (lambda (parent)
-                          (and (not (equal file parent)) (file-directory-p parent)
-                               (not (file-symlink-p parent))
-                               (neo-diredy--action-within file parent))) files)) files)))
-    files))
+    (if collapse (neo-diredy--collapse-targets files) files)))
+
+(defun neo-diredy--collapse-targets (files)
+  "Remove descendants covered by a selected directory in FILES."
+  (let ((directories (seq-filter (lambda (path)
+                                   (and (file-directory-p path) (not (file-symlink-p path)))) files)))
+    (seq-remove (lambda (file)
+                  (cl-some (lambda (parent) (and (not (equal file parent))
+                                                (neo-diredy--action-within file parent)))
+                           directories)) files)))
 
 (defun neo-diredy--action-exists (file)
   "Include dangling symlinks when checking FILE."
@@ -640,35 +644,42 @@ OVERWRITE permits replacing a regular file.  Return a symbol or a new path."
 
 ;;;###autoload
 (defun neo-diredy-paste ()
-  "Copy or move the internal clipboard into the displayed directory."
+  "Copy in the background or move the internal clipboard into this directory."
   (interactive)
   (neo-diredy--action-check)
   (unless neo-diredy--clipboard (user-error "Clipboard is empty"))
+  (neo-diredy--paste-files neo-diredy--clipboard))
+
+(defun neo-diredy--paste-files (clipboard)
+  "Resolve conflicts for CLIPBOARD in the foreground and perform the paste."
+  (when neo-diredy--copy-process (user-error "A copy is already running"))
   (require 'dired-aux)
-  (let* ((clipboard neo-diredy--clipboard) (kind (car clipboard))
+  (let* ((kind (car clipboard))
          (directory default-directory) (remaining (copy-sequence (cdr clipboard)))
-         (dired-copy-dereference nil) (dired-recursive-copies 'always)
          (dired-overwrite-confirmed nil) (overwrite-backup-query nil)
-         results changed claimed all stopped)
+         (claimed (make-hash-table :test 'equal))
+         results changed work all stopped)
     (dolist (source (cdr clipboard))
       (let ((destination (expand-file-name (file-name-nondirectory source) directory))
-            (status 'pending) detail overwrite)
+            (status 'pending) detail overwrite earlier backup)
         (if stopped (setq detail "Not processed after interruption")
           (condition-case err
               (progn
-                (unless (neo-diredy--action-exists source) (error "Source no longer exists"))
                 (when (file-remote-p source) (user-error "Remote source"))
+                (unless (neo-diredy--action-exists source) (error "Source no longer exists"))
                 (neo-diredy--action-destination-check source destination)
-                (while (and (neo-diredy--action-exists destination) (not overwrite)
+                (while (and (progn
+                              (setq earlier (gethash (neo-diredy--destination-key destination) claimed))
+                              (or (and earlier (eq kind 'copy)) (neo-diredy--action-exists destination)))
+                            (not overwrite)
                             (not (eq status 'skipped)))
                   (let* ((regular (and (file-regular-p source) (not (file-symlink-p source))
-                                       (file-regular-p destination) (not (file-symlink-p destination))))
+                                       (if (and earlier (eq kind 'copy)) (eq earlier 'regular)
+                                         (and (file-regular-p destination) (not (file-symlink-p destination))))))
                          ;; Overwrite-all never authorizes erasing output from
                          ;; another source in this same paste operation.
                          (choice (or (and regular all
-                                          (or (eq all 'skip)
-                                              (not (cl-member (neo-diredy--action-path destination) claimed
-                                                              :test #'neo-diredy--action-equal))) all)
+                                          (or (eq all 'skip) (not earlier)) all)
                                      (neo-diredy--action-conflict source destination regular))))
                     (pcase choice
                       ((or 'overwrite 'overwrite-all)
@@ -688,26 +699,210 @@ OVERWRITE permits replacing a regular file.  Return a symbol or a new path."
                        (neo-diredy--action-destination-check source destination))
                       (_ (signal 'quit nil)))))
                 (unless (eq status 'skipped)
-                  (push (neo-diredy--action-path destination) claimed)
-                  (message "%s %d/%d: %s" (if (eq kind 'cut) "Move" "Copy")
-                           (1+ (length results)) (length (cdr clipboard)) (file-name-nondirectory source))
-                  (let ((dired-overwrite-confirmed overwrite))
-                    (if (eq kind 'cut)
-                        (dired-rename-file source destination overwrite)
-                      (dired-copy-file source destination overwrite)))
-                  (unless (and (neo-diredy--action-exists destination)
-                               (or (eq kind 'copy) (not (neo-diredy--action-exists source))))
-                    (error "Operation did not finish"))
-                  (setq status 'done remaining (delete source remaining))))
+                  (if (eq kind 'copy)
+                      (progn
+                        (setq backup (and overwrite (neo-diredy--copy-backup destination)) status 'queued)
+                        (puthash (neo-diredy--destination-key destination)
+                                 (if (and (file-regular-p source) (not (file-symlink-p source))) 'regular 'other)
+                                 claimed))
+                    (message "Move %d/%d: %s" (1+ (length results)) (length (cdr clipboard))
+                             (file-name-nondirectory source))
+                    (let ((dired-overwrite-confirmed overwrite)) (dired-rename-file source destination overwrite))
+                    (unless (and (neo-diredy--action-exists destination) (not (neo-diredy--action-exists source)))
+                      (error "Operation did not finish"))
+                    (puthash (neo-diredy--destination-key destination) t claimed)
+                    (setq status 'done remaining (delete source remaining)))))
             (quit (setq stopped t detail "Interrupted; check the destination for partial data"))
             (error (setq status 'failed detail (concat (error-message-string err)
                                                        "; check the destination for partial data")))))
         (push (list source status destination detail) results)
+        (when (eq status 'queued)
+          (push (list (car results) overwrite (and overwrite (neo-diredy--copy-stamp destination)) backup)
+                work))
         (push source changed) (push destination changed)))
     (when (and (eq kind 'cut) (eq clipboard neo-diredy--clipboard))
       (setq neo-diredy--clipboard (when remaining (cons 'cut remaining))))
-    (neo-diredy--action-refresh changed)
-    (neo-diredy--action-report (if (eq kind 'cut) "Move" "Copy") (nreverse results))))
+    (setq results (nreverse results))
+    (if work
+        (if stopped
+            (progn (dolist (item work) (setf (cadr (car item)) 'pending))
+                   (neo-diredy--action-report "Copy cancelled" results))
+          (neo-diredy--copy-start results (vconcat (nreverse work))))
+      (neo-diredy--action-refresh changed)
+      (neo-diredy--action-report (if (eq kind 'cut) "Move" "Copy") results))))
+
+(defun neo-diredy--destination-key (file)
+  (let ((path (neo-diredy--action-path file)))
+    (if (eq system-type 'windows-nt) (downcase path) path)))
+
+(defun neo-diredy--copy-stamp (file)
+  "Identify the version of FILE that the user authorized overwriting."
+  (when-let* ((attrs (file-attributes file)))
+    (list (file-attribute-type attrs) (file-attribute-size attrs)
+          (file-attribute-modification-time attrs) (file-attribute-status-change-time attrs)
+          (file-attribute-file-identifier attrs))))
+
+(defun neo-diredy--copy-backup (destination)
+  "Resolve Dired backup prompts now, before starting an asynchronous paste."
+  (when-let* ((enabled dired-backup-overwrite)
+              (path (car (find-backup-file-name destination))))
+    (when (or (eq enabled 'always)
+              (dired-query 'overwrite-backup-query "Make backup for existing file `%s'? " destination))
+      (when (and (neo-diredy--action-exists path)
+                 (not (yes-or-no-p (format "Replace existing backup %s? " path))))
+        (user-error "Backup replacement declined"))
+      (cons path (neo-diredy--copy-stamp path)))))
+
+(defun neo-diredy--copy-encode (value)
+  (base64-encode-string (encode-coding-string (json-encode value) 'utf-8-unix) t))
+
+(defun neo-diredy--copy-decode (line)
+  (json-parse-string (decode-coding-string (base64-decode-string line) 'utf-8-unix)
+                     :array-type 'array :false-object nil))
+
+(defun neo-diredy--copy-worker ()
+  "Copy each input to its own staging path.  Only the parent publishes it."
+  (require 'dired-aux)
+  (pcase-let* ((`[,stage ,keep-time ,files] (neo-diredy--copy-decode (read-string "")))
+               (dired-copy-preserve-time keep-time)
+               (dired-copy-dereference nil) (dired-recursive-copies 'always)
+               (dired-backup-overwrite nil) (index 0) (last-update 0))
+    (cl-labels ((emit (event &optional value)
+                  (send-string-to-terminal
+                   (concat "COPY " (neo-diredy--copy-encode (vector index event (or value ""))) "\n")))
+                (progress (file &rest _)
+                  (when (> (- (float-time) last-update) 0.3)
+                    (setq last-update (float-time))
+                    (emit "progress" (file-name-nondirectory file)))))
+      (advice-add 'copy-file :before #'progress)
+      (unwind-protect
+          (seq-doseq (file files)
+            (emit "start")
+            (condition-case err
+                (progn (dired-copy-file file (expand-file-name (number-to-string index) stage) nil)
+                       (emit "ready"))
+              (error (emit "failed" (error-message-string err))))
+            (cl-incf index))
+        (advice-remove 'copy-file #'progress)))))
+
+(defun neo-diredy--copy-event (process event)
+  (pcase-let* ((`[,index ,kind ,detail] event)
+               (work (process-get process 'work))
+               (`(,row ,overwrite ,original ,backup) (aref work index))
+               (destination (nth 2 row)))
+    (pcase kind
+      ((or "start" "progress")
+       (setf (cadr row) 'running)
+       (process-put process 'progress
+                    (format "Copying %d/%d %s" (1+ index) (length work)
+                            (if (equal kind "progress") detail (file-name-nondirectory (car row))))))
+      ("failed" (setf (cadr row) 'failed (nth 3 row) detail))
+      ("ready"
+       (condition-case err
+           (let* ((staged (expand-file-name (number-to-string index) (process-get process 'stage)))
+                  (key (neo-diredy--destination-key destination))
+                  (published (process-get process 'published))
+                  (existing (neo-diredy--action-exists destination)))
+             (neo-diredy--action-destination-check (car row) destination)
+             (when existing
+               (unless (and overwrite (file-regular-p staged) (not (file-symlink-p staged))
+                            (file-regular-p destination) (not (file-symlink-p destination))
+                            (equal (gethash key published original) (neo-diredy--copy-stamp destination)))
+                 (error "Destination changed since the copy was requested"))
+               (when backup
+                 (let ((backup-key (neo-diredy--destination-key (car backup))))
+                   (unless (equal (gethash backup-key published (cdr backup)) (neo-diredy--copy-stamp (car backup)))
+                     (error "Backup changed since the copy was requested"))
+                   (rename-file destination (car backup) (and (neo-diredy--action-exists (car backup)) t))
+                   (puthash backup-key (neo-diredy--copy-stamp (car backup)) published))))
+             (condition-case failure
+                 (rename-file staged destination (and existing overwrite (not backup)))
+               (file-error
+                (when (and existing backup (not (neo-diredy--action-exists destination)))
+                  (rename-file (car backup) destination nil))
+                (signal (car failure) (cdr failure))))
+             (puthash key (neo-diredy--copy-stamp destination) published)
+             (setf (cadr row) 'done))
+         ((error quit) (setf (cadr row) 'failed (nth 3 row) (error-message-string err)))))))
+  (force-mode-line-update t))
+
+(defun neo-diredy--copy-filter (process text)
+  "Consume complete worker messages even when the pipe splits a line."
+  (let* ((lines (split-string (concat (process-get process 'tail) text) "\n"))
+         (tail (car (last lines))))
+    (process-put process 'tail tail)
+    (dolist (line (butlast lines))
+      (when (and (eq process neo-diredy--copy-process) (string-prefix-p "COPY " line))
+        (neo-diredy--copy-event process (neo-diredy--copy-decode (substring line 5)))))))
+
+(defun neo-diredy--copy-finish (process reason)
+  "Finalize PROCESS, retaining any unpublished output and its exact path."
+  (setq neo-diredy--copy-process nil)
+  (remove-hook 'kill-emacs-hook #'neo-diredy-cancel-copy)
+  (let ((stage (process-get process 'stage)) (work (process-get process 'work))
+        (results (process-get process 'results)))
+    (dotimes (i (length work))
+      (let* ((row (car (aref work i))) (path (expand-file-name (number-to-string i) stage)))
+        (when (memq (cadr row) '(queued running))
+          (setf (cadr row) (if (process-get process 'cancelled) 'pending 'failed)
+                (nth 3 row) (or reason "Copy worker stopped before completing this item")))
+        (when (and (not (eq (cadr row) 'done)) (neo-diredy--action-exists path))
+          (setf (nth 3 row) (format "%s; check staged data at %s" (or (nth 3 row) "") path)))))
+    ;; Never recursively remove staged data after failure or interruption.
+    (condition-case nil (delete-directory stage) (file-error nil))
+    (neo-diredy--action-refresh (mapcar (lambda (row) (nth 2 row)) results))
+    (neo-diredy--action-report "Copy" results)))
+
+(defun neo-diredy--copy-start (results work)
+  (let ((prefix (expand-file-name ".neo-diredy-copy-" default-directory))
+        (default-directory invocation-directory) stage process)
+    (condition-case err
+        (progn
+          (setq stage (make-temp-file prefix t))
+          (setq process
+                (make-process :name "neo-diredy-copy" :connection-type 'pipe :coding 'utf-8-unix
+                              :noquery t :command (list (expand-file-name invocation-name invocation-directory)
+                                                       "-Q" "--batch" "-l" neo-diredy--library
+                                                       "-f" "neo-diredy--copy-worker")
+                              :filter #'neo-diredy--copy-filter
+                              :sentinel (lambda (proc _event)
+                                          (when (and (eq proc neo-diredy--copy-process)
+                                                     (memq (process-status proc) '(exit signal)))
+                                            (neo-diredy--copy-finish proc nil)))))
+          (process-put process 'work work)
+          (process-put process 'results results)
+          (process-put process 'stage stage)
+          (process-put process 'published (make-hash-table :test 'equal))
+          (process-put process 'progress (format "Copying 0/%d" (length work)))
+          (setq neo-diredy--copy-process process)
+          (add-hook 'kill-emacs-hook #'neo-diredy-cancel-copy)
+          (process-send-string process
+                               (concat (neo-diredy--copy-encode
+                                        (vector stage (if dired-copy-preserve-time t :json-false)
+                                                (vconcat (mapcar #'caar work)))) "\n"))
+          (process-send-eof process)
+          (force-mode-line-update t)
+          (message "Copying %d item(s) in the background" (length work)))
+      ((error quit)
+       (if process
+           (progn (set-process-sentinel process #'ignore)
+                  (when (process-live-p process) (delete-process process))
+                  (neo-diredy--copy-finish process (error-message-string err)))
+         (when stage (delete-directory stage))
+         (dolist (item (append work nil))
+           (setf (cadr (car item)) 'failed (nth 3 (car item)) (error-message-string err)))
+         (neo-diredy--action-report "Copy" results))))))
+
+;;;###autoload
+(defun neo-diredy-cancel-copy ()
+  "Stop the current copy and report any unpublished staged data."
+  (interactive)
+  (when-let* ((process neo-diredy--copy-process))
+    (process-put process 'cancelled t)
+    (set-process-sentinel process #'ignore)
+    (set-process-filter process #'ignore)
+    (when (process-live-p process) (delete-process process))
+    (neo-diredy--copy-finish process "Cancelled before publication")))
 
 (defun neo-diredy--confirm-delete (files trash)
   "Show all FILES and confirm the actual deletion mode TRASH."
@@ -751,6 +946,7 @@ OVERWRITE permits replacing a regular file.  Return a symbol or a new path."
                                           (not (derived-mode-p 'wdired-mode))
                                           (neo-diredy--action-marks))))
                     (format "*%d" (length marks)))
+                  (when neo-diredy--copy-process (process-get neo-diredy--copy-process 'progress))
                   (when neo-diredy--clipboard
                     (format "%s %d" (if (eq (car neo-diredy--clipboard) 'cut) "Cut" "Copy")
                             (length (cdr neo-diredy--clipboard)))))) " · "))
@@ -833,15 +1029,17 @@ OVERWRITE permits replacing a regular file.  Return a symbol or a new path."
     (neo-diredy--action-view (format "Targets (%d)" (length files)) files)))
 
 (defun neo-diredy-show-results ()
-  "Show the last operation's per-item outcomes."
+  "Show current copy progress or the last operation's per-item outcomes."
   (interactive)
-  (unless neo-diredy--action-results (user-error "No operation results"))
-  (neo-diredy--action-view
+  (let ((rows (if neo-diredy--copy-process (process-get neo-diredy--copy-process 'results)
+                neo-diredy--action-results)))
+    (unless rows (user-error "No operation results"))
+    (neo-diredy--action-view
    "Results" (mapcar (lambda (row)
                        (format "%s  %s%s%s" (cadr row) (car row)
                                (if (nth 2 row) (concat " → " (nth 2 row)) "")
                                (if (nth 3 row) (concat "\n    " (nth 3 row)) "")))
-                     neo-diredy--action-results)))
+                     rows))))
 
 ;;; Reveal uses Unicode Shell item IDs, grouping selections by parent.
 
@@ -913,15 +1111,59 @@ foreach ($group in $groups) {
   (json-encode (vconcat (mapcar (lambda (group)
                                 `((directory . ,(car group)) (files . ,(vconcat (cdr group))))) groups))))
 
-(defun neo-diredy--reveal-command ()
-  "Return the fixed Windows PowerShell helper command."
+(defun neo-diredy--powershell-command (script)
+  "Run fixed SCRIPT in the system Windows PowerShell STA."
   (let ((program (and (eq system-type 'windows-nt)
                       (expand-file-name "System32/WindowsPowerShell/v1.0/powershell.exe"
                                         (or (getenv "SystemRoot") "C:/Windows")))))
     (unless (and program (file-executable-p program))
-      (user-error "Reveal requires Windows PowerShell"))
+      (user-error "This action requires Windows PowerShell"))
     (list program "-NoLogo" "-NoProfile" "-NonInteractive" "-STA" "-OutputFormat" "Text" "-EncodedCommand"
-          (base64-encode-string (encode-coding-string neo-diredy--reveal-script 'utf-16le) t))))
+          (base64-encode-string (encode-coding-string script 'utf-16le) t))))
+
+(defun neo-diredy--reveal-command ()
+  (neo-diredy--powershell-command neo-diredy--reveal-script))
+
+(defconst neo-diredy--explorer-files-script
+  "$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
+$data = [Windows.Forms.Clipboard]::GetDataObject()
+$paths = @()
+if ($null -ne $data -and $data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop, $false)) {
+  $paths = @($data.GetData([Windows.Forms.DataFormats]::FileDrop, $false))
+}
+[Console]::Write((ConvertTo-Json -InputObject $paths -Compress))")
+
+(defun neo-diredy--explorer-files ()
+  "Return the native Windows FileDrop list as local absolute paths."
+  (let* ((command (neo-diredy--powershell-command neo-diredy--explorer-files-script))
+         (default-directory (file-name-directory (car command)))
+         (coding-system-for-read 'utf-8-unix))
+    (with-temp-buffer
+      (unless (zerop (apply #'call-process (car command) nil (list (current-buffer) nil) nil (cdr command)))
+        (user-error "Could not read the Windows clipboard"))
+      (goto-char (point-min))
+      (let ((paths (json-parse-buffer :array-type 'array)))
+        (unless (and (vectorp paths)
+                     (seq-every-p (lambda (file)
+                                    (and (stringp file) (file-name-absolute-p file)
+                                         (not (file-remote-p file)))) paths))
+          (user-error "Invalid Windows file list"))
+        (neo-diredy--collapse-targets
+         (cl-remove-duplicates
+          (mapcar (lambda (file) (directory-file-name (expand-file-name file))) paths)
+          :test #'neo-diredy--action-equal :from-end t))))))
+
+;;;###autoload
+(defun neo-diredy-paste-from-explorer ()
+  "Copy files on the Windows clipboard into the current Dired directory."
+  (interactive)
+  (neo-diredy--action-check)
+  (when neo-diredy--copy-process (user-error "A copy is already running"))
+  (let ((files (neo-diredy--explorer-files)))
+    (unless files (user-error "No copied files on the Windows clipboard"))
+    (neo-diredy--paste-files (cons 'copy files))))
 
 (defun neo-diredy--reveal-report (groups output failure)
   "Report each item in GROUPS using helper OUTPUT or FAILURE."
@@ -1011,6 +1253,8 @@ foreach ($group in $groups) {
                    (,(if neo-diredy--clipboard
                          (format "v  Paste (%s %d)" (car neo-diredy--clipboard) (length (cdr neo-diredy--clipboard)))
                        "v  Paste") . paste)
+                   ("e  Paste from Explorer" . explorer-paste)
+                   ,@(when neo-diredy--copy-process '(("z  Cancel copy" . cancel-copy)))
                    (,(let ((count (length (neo-diredy--reveal-groups (neo-diredy--action-targets)))))
                        (if (> count 1) (format "r  Reveal (%d folders)" count) "r  Reveal")) . reveal)
                    (,(if delete-by-moving-to-trash "d  Trash…" "d  Delete…") . delete)
@@ -1021,18 +1265,23 @@ foreach ($group in $groups) {
     (unless files
       (dolist (action '(copy cut reveal delete targets mark))
         (push (cons action "No target") disabled)))
-    (unless (eq system-type 'windows-nt) (push '(reveal . "Windows only") disabled))
+    (unless (eq system-type 'windows-nt)
+      (push '(reveal . "Windows only") disabled) (push '(explorer-paste . "Windows only") disabled))
+    (when neo-diredy--copy-process
+      (push '(explorer-paste . "Copy running") disabled) (push '(paste . "Copy running") disabled))
     (when neo-diredy--reveal-process (push '(reveal . "Reveal running") disabled))
     (unless neo-diredy--clipboard
       (push '(paste . "Clipboard empty") disabled) (push '(clear . "Clipboard empty") disabled))
-    (unless neo-diredy--action-results (push '(results . "No results") disabled))
+    (unless (or neo-diredy--copy-process neo-diredy--action-results) (push '(results . "No results") disabled))
     (when-let* ((choice (neo-diredy--read-choice
                         (format "Actions · %d" (length files)) choices
-                        (list :keys '((?c . copy) (?x . cut) (?v . paste) (?r . reveal) (?d . delete)
+                        (list :keys '((?c . copy) (?x . cut) (?v . paste) (?e . explorer-paste)
+                                      (?z . cancel-copy) (?r . reveal) (?d . delete)
                                       (?? . targets) (?m . mark) (?a . all) (?u . unmark) (?q . clear) (?! . results))
                               :disabled disabled))))
       (pcase (cdr choice)
         ('copy (neo-diredy-copy)) ('cut (neo-diredy-cut)) ('paste (neo-diredy-paste))
+        ('explorer-paste (neo-diredy-paste-from-explorer)) ('cancel-copy (neo-diredy-cancel-copy))
         ('reveal (neo-diredy-reveal)) ('delete (neo-diredy-delete))
         ('targets (neo-diredy-show-targets)) ('results (neo-diredy-show-results))
         ('mark (neo-diredy-toggle-mark)) ('all (neo-diredy-mark-all))
@@ -2739,6 +2988,7 @@ Disable to restore normal Dired.  Narrow and remote windows are left alone."
   "Remove active hooks, advice and windows before unloading the package."
   (neo-diredy-mode -1)
   (neo-diredy--reveal-stop)
+  (neo-diredy-cancel-copy)
   (setq neo-diredy--clipboard nil neo-diredy--action-results nil)
   nil)
 
